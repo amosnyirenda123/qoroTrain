@@ -1,0 +1,25 @@
+[project]
+name = "qorotrain"
+version = "0.1.0"
+description = "Event-driven LLM agent framework for autonomous hyperparameter tuning from streamed training telemetry"
+readme = "README.md"
+authors = [
+    { name = "amosnyirenda123", email = "nyirendaamos1@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=1.4.7",
+    "langchain-chroma>=1.1.0",
+    "langchain-google-genai>=4.4.2",
+    "langchain-openai>=1.7.2",
+    "langgraph>=1.2.18",
+    "paho-mqtt>=2.1.0",
+    "pgvector>=0.5.1",
+]
+
+[project.scripts]
+qorotrain = "qorotrain:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"
