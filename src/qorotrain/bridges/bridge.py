@@ -170,7 +170,7 @@ class Bridge:
         if connector is None:
             return False
 
-        connector.close()
+        connector.disconnect()
 
         with self._db_lock:
             self._db_conn.execute(
@@ -314,7 +314,7 @@ class Bridge:
 
         for connector in self._connectors.values():
             try:
-                connector.close()
+                connector.disconnect()
             except Exception:
                 log.exception("Error closing connector.")
 

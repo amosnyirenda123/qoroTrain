@@ -1,22 +1,29 @@
-# LoopTune
+# Qorotrain
 
-**Event-driven LLM agents for automated hyperparameter tuning from streamed training telemetry.**
+**Declarative, event-driven LLM agents for automated hyperparameter tuning from streamed training telemetry.**
 
-> *LoopTune is a working name; rename it freely.*
->
+Describe your experiment in a YAML file. Qorotrain runs your notebook, streams its metrics, and tunes its hyperparameters.
+
+```bash
+qorotrainctl run -f experiment.yaml
+```
+
 > **Status: in development.** This is a final-year project (PFA) at ENSA Tétouan. The interfaces below describe the intended design and may change while the first version is built. Sections marked *planned* are not implemented yet.
+>
+> **Version 1 scope:** training jobs are Jupyter notebooks, MQTT is the only broker, and the agent tunes parameter values only (it never edits notebook code).
 
 ---
 
 ## What it does
 
-Training a model usually means running an experiment, reading the logs, changing a few hyperparameters, and running again. LoopTune automates that loop:
+Training a model usually means running an experiment, reading the logs, changing a few hyperparameters, and running again. Qorotrain automates that loop:
 
-1. Your training script streams metrics over MQTT.
-2. A collector summarizes the stream as it arrives.
-3. When the run finishes, a tuning algorithm (an LLM agent, random search, or Optuna) proposes new parameters.
-4. You approve, edit, or reject the proposal.
-5. A runner relaunches the training with the approved parameters.
+1. You declare the notebook, the objective, and the hyperparameters in `experiment.yaml`.
+2. Qorotrain executes the notebook, which streams metrics over MQTT.
+3. A collector summarizes the stream as it arrives.
+4. When the run finishes, a tuning algorithm (an LLM agent, random search, or Optuna) proposes new parameters.
+5. You approve, edit, or reject the proposal.
+6. The runner re-executes the notebook with the approved parameters.
 
 The LLM never runs inside the training loop, so it adds no latency to training.
 
@@ -29,32 +36,34 @@ The LLM never runs inside the training loop, so it adds no latency to training.
 
 ## Features
 
-- **Framework-agnostic.** The only contract with your code is a small JSON message schema. Tested on NumPy and PyTorch workloads (*planned*: scikit-learn).
+- **Declarative.** One YAML file describes the whole experiment, and it can be versioned in Git.
+- **Framework-agnostic.** The only contract with your notebook is a small message schema. Evaluated on NumPy and PyTorch workloads (*planned*: scikit-learn).
 - **Event-driven.** Components communicate through an MQTT broker (Mosquitto) and react to messages instead of polling.
 - **Swappable tuning algorithms.** `agent`, `random`, and `optuna` share the same pipeline, so comparisons isolate the algorithm.
 - **Streaming summaries.** Metrics are micro-batched and summarized incrementally (trend, plateau, divergence, downsampled curve), so the agent receives a compact report instead of raw logs.
 - **Human in the loop.** Every proposal is shown with a diff and a rationale before anything runs.
-- **Persistent state.** Metrics, runs, proposals, decisions, and the routing table are stored in SQLite.
+- **Validated before it runs.** `qorotrainctl validate` checks the YAML, the notebook, and the broker connection.
+- **Persistent state.** Metrics, runs, proposals, decisions, and the routing table are stored in SQLite, and every run keeps its executed notebook.
 
 ## Architecture
 
 ```
-Training job ──metrics/status──▶ [ Mosquitto ] ◀──▶ Connector ◀──▶ Bridge ◀──▶ Tuner
- (telemetry client)                    ▲                           (routing table)  │
-        ▲                              │                                         ▼
-        └────────── launches ───── Runner ◀──── command/start ◀──── Review ◀── Tuning algorithm
-                                                                      ▲        (agent / random / optuna)
-                                                                    User
+Training notebook ──metrics/status──▶ [ Mosquitto ] ◀──▶ Connector ◀──▶ Bridge ◀──▶ Tuner
+ (telemetry client)                         ▲                          (routing table)  │
+        ▲                                   │                                         ▼
+        └───────── launches ────────── Runner ◀──── command/start ◀──── Review ◀── Tuning algorithm
+                                                                          ▲       (agent / random / optuna)
+                                                                        User
 ```
 
 | Component | Responsibility |
 |---|---|
-| **Telemetry client** | Small library used inside the training code. Publishes metrics, parameters, and status. No ML dependencies. |
+| **Telemetry client** | Small library used inside the notebook. Publishes metrics, parameters, and status. No ML dependencies. |
 | **Connector** | Broker abstraction. `MQTTConnector` (Paho) is implemented; RabbitMQ and Kafka are out of scope for now. |
 | **Bridge** | Manages connectors, keeps the routing table in SQLite, and delivers messages to tuners. |
 | **Tuner** | Collects and summarizes telemetry, calls its tuning algorithm, validates proposals, and publishes start commands. |
 | **Tuning algorithm** | Decides what to try next from the trial history. |
-| **Runner** | Receives start commands and launches the notebook or script with the given parameters. |
+| **Runner** | Receives start commands and executes the notebook with the given parameters (Papermill). |
 
 ### Topics
 
@@ -93,26 +102,12 @@ docker compose up -d
 pip install -e .
 ```
 
-### 2. Instrument your training
-
-```python
-from looptune import Tracker
-
-tracker = Tracker(project="dqn-cartpole", broker="localhost:1883")
-tracker.start(params={"learning_rate": lr, "gamma": gamma})
-
-for ep in range(num_episodes):
-    ...
-    tracker.log(step=ep, reward=total_reward, loss=avg_loss, epsilon=epsilon)
-
-tracker.finish(objective=mean_reward_last_100)
-```
-
-### 3. Parameterize the notebook
+### 2. Prepare the notebook
 
 Tag one cell as `parameters` (Papermill convention) and keep it to plain assignments. Compute derived values and build objects in the next cell, or injected values will not take effect.
 
 ```python
+# cell tagged "parameters"
 learning_rate = 5e-4
 gamma = 0.9
 epsilon_decay_steps = 150
@@ -120,26 +115,112 @@ num_episodes = 300
 seed = 31
 ```
 
-### 4. Declare the search space
+Add the telemetry calls. The runner passes the run ID and broker address through environment variables (`QOROTRAIN_RUN_ID`, `QOROTRAIN_BROKER`), so the tracker needs no arguments.
+
+```python
+from qorotrain import Tracker
+
+tracker = Tracker()
+tracker.start(params={"learning_rate": learning_rate, "gamma": gamma})
+
+for ep in range(num_episodes):
+    ...
+    tracker.log(step=ep, reward=total_reward, loss=avg_loss, epsilon=epsilon)
+
+tracker.finish()
+```
+
+### 3. Describe the experiment
 
 ```yaml
-# space.yaml
-objective: {metric: mean_reward_last_100, direction: maximize}
-params:
-  learning_rate:       {type: float, min: 1e-5, max: 1e-2, log: true}
-  gamma:               {type: float, min: 0.9, max: 0.999}
-  epsilon_decay_steps: {type: int,   min: 100, max: 20000, log: true}
+# experiment.yaml
+version: 1
+application: {name: dqn-demo}
+bridge:
+  connectors:
+    - {type: mqtt, host: localhost}
+tuner: {algorithm: random, max_runs: 8}
+job:
+  source: dqn-cartpole.ipynb
+  objective: {metric: reward, aggregate: mean_last_100, direction: maximize}
+  hyperparameters:
+    learning_rate: {type: float, min: 1e-5, max: 1e-2, log: true}
 ```
 
-Every proposal is validated against this file before it reaches the runner.
-
-### 5. Run the loop
+### 4. Validate and run
 
 ```bash
-looptune run dqn-cartpole.ipynb --space space.yaml --algorithm agent --max-runs 8
+qorotrainctl validate -f experiment.yaml     # checks the YAML, the notebook, and the broker
+qorotrainctl run -f experiment.yaml --dry-run
+qorotrainctl run -f experiment.yaml
 ```
 
-Use `--algorithm random` or `--algorithm optuna` for the baselines, and `--auto-approve` for unattended experiments.
+`validate` parses the notebook and checks that one cell is tagged `parameters`, that every declared hyperparameter is assigned there, and that the cell contains only plain assignments. The current value of each parameter is read from the notebook, so `initial` is optional.
+
+## Configuration reference
+
+Unknown keys are rejected. Values of the form `${NAME}` are read from environment variables, so secrets stay out of the file.
+
+```yaml
+version: 1                          # schema version of this file
+application:
+  name: dqn-cartpole-tuning
+  log_level: info                   # info | debug
+
+bridge:
+  workers: 4                        # dispatch workers
+  topic_root: tuning
+  connectors:                       # a pool; more than one is allowed
+    - name: local-mqtt
+      type: mqtt
+      host: localhost
+      port: 1883
+      username: ${MQTT_USER}        # optional
+      password: ${MQTT_PASSWORD}
+      default_qos: 1                # client_id is generated if omitted
+  routes:                           # optional per-handler overrides
+    - {handler: tuner.on_metrics, qos: 0, batch: 200}
+
+store:
+  path: ./qorotrain.db
+
+tuner:
+  algorithm: agent                  # agent | random | optuna
+  max_runs: 8
+  stop: {target: 450, patience: 3}  # target reached, or no improvement in 3 runs
+  review: {mode: manual}            # manual | auto
+  summarizer:
+    flush_every: 200
+    flush_seconds: 2.0
+    ema: {fast: 0.1, slow: 0.01}
+    plateau: {window: 50, epsilon: 0.01}
+  agent:
+    llm: {provider: ollama, model: "qwen2.5:3b", temperature: 0.2}
+    use_notebook_context: true
+    retrieval: false
+
+runner:
+  workdir: ../notebooks
+  kernel: python3
+  timeout: 3600                     # seconds, applies per notebook cell
+  output_dir: ./runs                # executed notebook saved for every run
+
+job:
+  name: dqn
+  source: ../notebooks/dqn-cartpole.ipynb
+  objective:
+    metric: reward
+    aggregate: mean_last_100        # how streamed values become one score
+    direction: maximize
+  hyperparameters:                  # what the tuner may change
+    learning_rate:       {type: float, min: 1e-5, max: 1e-2, log: true}
+    gamma:               {type: float, min: 0.9, max: 0.999}
+    epsilon_decay_steps: {type: int,   min: 100, max: 20000, log: true}
+    hidden_size:         {type: int,   choices: [32, 64, 128]}
+  fixed:                            # passed to every run, never tuned
+    num_episodes: 300
+    seed: 31
+```
 
 ## Tuning algorithms
 
@@ -172,7 +253,9 @@ Results will be added once the experiments are complete.
 ## Project structure (*proposed*)
 
 ```
-looptune/
+qorotrain/
+├── cli/           # qorotrainctl (run, validate)
+├── config/        # YAML schema (Pydantic models), loader, notebook validation
 ├── client/        # telemetry client (Tracker)
 ├── connectors/    # Connector base class, MQTTConnector
 ├── bridge/        # Bridge, routing table, subscription registry
@@ -180,13 +263,14 @@ looptune/
 ├── store/         # SQLite schema and queries
 ├── tuner/         # Tuner, TuningAlgorithm, algorithms (agent, random, optuna)
 ├── review/        # CLI review step
-├── runner/        # notebook and script launcher (Papermill)
+├── runner/        # notebook execution (Papermill)
 ├── examples/      # n-armed-bandits, dqn-cartpole
 └── docs/          # report, diagrams
 ```
 
 ## Roadmap
 
+- [ ] YAML schema, loader, and `validate` command
 - [ ] Telemetry client and Mosquitto setup
 - [ ] Connector, bridge, and SQLite routing table
 - [ ] Collector with micro-batching and incremental summaries
@@ -197,7 +281,7 @@ looptune/
 - [ ] Experiments on the bandit and DQN notebooks
 - [ ] Retrieval over past trials
 - [ ] Mid-run alerts and early stopping
-- [ ] RabbitMQ and Kafka connectors
+- [ ] Python script jobs, and RabbitMQ and Kafka connectors
 
 ## Requirements
 
