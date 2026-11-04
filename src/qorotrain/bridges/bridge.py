@@ -1,346 +1,284 @@
 import logging
-import os
-import sqlite3
+import queue
 import threading
-import uuid
+from typing import Mapping, Sequence
 
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
-from typing import Literal, List
-
-from ..connectors.connector import MQTTConnector
+from .table import BridgeTable
+from ..connectors.config import BrokerConfig
+from ..connectors.connector import Connector
+from ..connectors.factory import create_connector
+from ..messages.message import Message
 from ..routes.route import Route
 from ..tuners.tuner import Tuner
-from ..messages.message import Message
-from ..config import BrokerConfig, MQTTConfig, RabbitMQConfig, KafkaConfig
-
 
 log = logging.getLogger(__name__)
 
 
 class Bridge:
-    """
-    Coordinates broker connectors, routing and tuner communication.
+    """Coordinates connectors, routing and tuner communication.
 
-    The Bridge is responsible for managing the lifecycle of
-    connectors and forwarding incoming telemetry to a Tuner.
-    """
+    Incoming path:  connector (network thread) -> queue -> dispatch thread -> route handlers
+    Outgoing path:  tuner -> ``Bridge.publish`` -> connector
 
+    Connectors call back on the broker client's network thread, so the only
+    work done there is putting the message on a queue. Handlers (which may be
+    slow, e.g. an LLM call) run on a single dispatch thread, in arrival order.
+
+    A message that matches several routes is delivered to all of them.
+    When the queue is full, new messages are dropped and counted in ``dropped``.
+    """
+    
     def __init__(
-            self,
-            broker: Literal['mqtt', 'rabbitmq', 'kafka'],
-            broker_config: BrokerConfig,
-            n_jobs: int = -1,
-            routes: List[Route] | None = None,
-            tuner: Tuner | None = None,
-            bridge_table_path: str = 'bridge.db'
-    ):
-        self._broker = broker
-        self._broker_config = broker_config
-        self._n_jobs = n_jobs
-        self._routes = routes or []
-        self._tuner = tuner
-        self._bridge_table_path = bridge_table_path
+        self,
+        connectors: Mapping[str, Connector] | Sequence[Connector],
+        routes: Sequence[Route] | None = None,
+        tuner: Tuner | None = None,
+        db_path: str = "bridge.db",
+        queue_size: int = 10_000,
+    ) -> None:
+        if isinstance(connectors, Mapping):
+            self._connectors = dict(connectors)
+        else:
+            self._connectors = {f"connector-{i}": c for i, c in enumerate(connectors)}
+        if not self._connectors:
+            raise ValueError("At least one connector is required.")
 
-        self._connectors = {}
-        self._futures = {}
+        self._routes: list[Route] = list(routes or [])
+        self._subscribed: dict[str, int | None] = {}
+        self._lock = threading.RLock()
 
-        self._num_active_connectors = 0
+        self._table = BridgeTable(db_path)
+        self._queue_size = queue_size
+        self._queue: queue.Queue[Message] | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._dropped = 0
 
-        self._db_conn = None
-        self._db_lock = threading.Lock()
-
-        self._thread_pool = None
-        self._stop_event = threading.Event()
+        self._tuner: Tuner | None = None
+        self._tuner_routes: list[Route] = []
+        self._tuner_started = False
 
         self._started = False
 
-    def _init_thread_pool(self):
-        if self._n_jobs == -1:
-            max_workers = min(32, (os.cpu_count() or 1) + 4)
-        else:
-            if self._n_jobs < 1:
-                raise ValueError('n_jobs must be -1 or positive.')
-            max_workers = self._n_jobs
+        if tuner is not None:
+            self.attach(tuner)
 
-        self._thread_pool = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix='bridge-connector'
-        )
+    @classmethod
+    def from_config(
+        cls, config: BrokerConfig | Sequence[BrokerConfig], **kwargs
+    ) -> "Bridge":
+        configs = list(config) if isinstance(config, (list, tuple)) else [config]
+        return cls([create_connector(c) for c in configs], **kwargs)
 
-    def _init_db(self):
-        self._db_conn = sqlite3.connect(
-            self._bridge_table_path,
-            check_same_thread=False
-        )
+    # ------------------------------------------------------------ properties
 
-        with self._db_lock:
-            self._db_conn.execute("""
-                CREATE TABLE IF NOT EXISTS bridge_table (
-                    connector_id TEXT PRIMARY KEY,
-                    connector_ip TEXT,
-                    broker_id TEXT,
-                    broker_ip TEXT,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    last_checked TEXT
-                )
-            """)
-            self._db_conn.commit()
+    @property
+    def started(self) -> bool:
+        return self._started
 
-    def _init_mqtt(self, config):
-        connector = MQTTConnector(
-            config=config
-        )
+    @property
+    def dropped(self) -> int:
+        """Messages dropped because the dispatch queue was full."""
+        return self._dropped
 
-        return [connector]
+    @property
+    def routes(self) -> list[Route]:
+        with self._lock:
+            return list(self._routes)
 
-    def _init_rabbitmq(self, config):
-        raise NotImplementedError("RabbitMQ is not supported yet.")
+    def status(self) -> list[dict]:
+        """Connector rows from the bridge table (empty when the bridge is closed)."""
+        return self._table.connectors()
 
-    def _init_kafka(self, config):
-        raise NotImplementedError("Kafka is not supported yet.")
+    def routing_table(self) -> list[dict]:
+        """Route rows from the bridge table (empty when the bridge is closed)."""
+        return self._table.routes()
 
-    def _check_config(self):
-        match self._broker:
-            case 'mqtt':
-                return isinstance(self._broker_config, MQTTConfig)
-            case 'rabbitmq':
-                return isinstance(self._broker_config, RabbitMQConfig)
-            case 'kafka':
-                return isinstance(self._broker_config, KafkaConfig)
+    # --------------------------------------------------------------- routing
 
-    def _init_connectors(self):
+    def add_route(self, route: Route) -> Route:
+        with self._lock:
+            if route in self._routes:
+                return route
+            self._routes.append(route)
+            if self._started:
+                self._table.add_route(route)
+                self._sync_subscription(route.topic)
+        return route
 
-        match self._broker:
-            case "mqtt":
-                if not self._check_config():
-                    raise TypeError(
-                        "broker_config must be an MQTTConfig for broker='mqtt'."
-                    )
-                return self._init_mqtt(self._broker_config)
-
-            case "rabbitmq":
-                if not self._check_config():
-                    raise TypeError(
-                        "broker_config must be a RabbitMQConfig for broker='rabbitmq'."
-                    )
-                return self._init_rabbitmq(self._broker_config)
-
-            case "kafka":
-                if not self._check_config():
-                    raise TypeError(
-                        "broker_config must be a KafkaConfig for broker='kafka'."
-                    )
-                return self._init_kafka(self._broker_config)
-
-            case _:
-                raise ValueError(
-                    f"Unsupported broker: {self._broker}"
-                )
-
-    def register(self, connector):
-        connector_id = str(uuid.uuid4())
-
-        self._connectors[connector_id] = connector
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        with self._db_lock:
-            self._db_conn.execute(
-                """
-                INSERT INTO bridge_table (
-                    connector_id,
-                    status,
-                    created_at
-                )
-                VALUES (?, ?, ?)
-                """,
-                (connector_id, "registered", now)
-            )
-
-            self._db_conn.commit()
-
-        return connector_id
-
-    def unregister(self, connector_id: str):
-
-        connector = self._connectors.pop(connector_id, None)
-
-        if connector is None:
-            return False
-
-        connector.disconnect()
-
-        with self._db_lock:
-            self._db_conn.execute(
-                """
-                UPDATE bridge_table
-                SET status = ?, last_checked = ?
-                WHERE connector_id = ?
-                """,
-                (
-                    "stopped",
-                    datetime.now(timezone.utc).isoformat(),
-                    connector_id
-                )
-            )
-
-            self._db_conn.commit()
-
+    def drop_route(self, route: Route) -> bool:
+        """Remove a route. The broker subscription is dropped with the last route using it."""
+        with self._lock:
+            if route not in self._routes:
+                return False
+            self._routes.remove(route)
+            if self._started:
+                self._table.drop_route(route)
+                if any(r.topic == route.topic for r in self._routes):
+                    self._sync_subscription(route.topic)  # the QoS may have changed
+                else:
+                    for connector in self._connectors.values():
+                        connector.unsubscribe(route.topic)
+                    self._subscribed.pop(route.topic, None)
         return True
 
-    def _update_status(self, connector_id, status):
+    def _qos_for(self, topic: str) -> int | None:
+        explicit = [r.qos for r in self._routes if r.topic == topic and r.qos is not None]
+        return max(explicit) if explicit else None
 
-        with self._db_lock:
-            self._db_conn.execute(
-                """
-                UPDATE bridge_table
-                SET status = ?, last_checked = ?
-                WHERE connector_id = ?
-                """,
-                (
-                    status,
-                    datetime.now(timezone.utc).isoformat(),
-                    connector_id
-                )
-            )
+    def _sync_subscription(self, topic: str) -> None:
+        """Subscribe on every connector, but only if the topic or its QoS is new."""
+        qos = self._qos_for(topic)
+        if topic in self._subscribed and self._subscribed[topic] == qos:
+            return
+        for connector in self._connectors.values():
+            connector.subscribe(topic, qos)
+        self._subscribed[topic] = qos
 
-            self._db_conn.commit()
-
-    def status(self):
-
-        with self._db_lock:
-            cursor = self._db_conn.execute(
-                """
-                SELECT connector_id, status, created_at, last_checked
-                FROM bridge_table
-                """
-            )
-
-            return cursor.fetchall()
+    # ----------------------------------------------------------------- tuner
 
     def attach(self, tuner: Tuner) -> "Bridge":
-
+        if self._tuner is not None:
+            raise RuntimeError("A tuner is already attached; detach it first.")
         self._tuner = tuner
+        self._tuner_routes = [self.add_route(r) for r in tuner.routes()]
+        if self._started:
+            tuner.start(self)
+            self._tuner_started = True
         return self
 
-    def detach(self):
-        self._tuner = None
-
-    def _dispatch(self, route, message):
-
-        if self._tuner is None:
-            log.warning("Message received but no tuner is attached.")
+    def detach(self) -> None:
+        tuner = self._tuner
+        if tuner is None:
             return
-        self._tuner.update(route, message)
+        for route in self._tuner_routes:
+            self.drop_route(route)
+        if self._tuner_started:
+            tuner.stop()
+        self._tuner = None
+        self._tuner_routes = []
+        self._tuner_started = False
 
-    # Handling biderectional communication between Tuner and Connector
+    # ------------------------------------------------------------- messaging
 
-    def _update_tuner(self, route, message):
-        self._dispatch(route, message)
-
-    # One direction (Connector to Tuner through bridge)
-    def _sync(self, connector_id, connector):
-        self._update_status(connector_id, 'running')
-
-        try:
-            connector.connect()
-
-            # subscribe to all routes
-            for route in self._routes:
-                connector.subscribe(
-                    route.topic,
-                    lambda msg, _route=route: self._update_tuner(_route, msg)
-                )
-
-            while not self._stop_event.is_set():
-                self._stop_event.wait(1.0)
-
-        except Exception:
-            self._update_status(connector_id, 'error')
-            raise
-
-    # Another direction (Tuner to Connector Through bridge)
-
-    def publish(self, message: Message, connector_id: str | None = None):
-        if not self._connectors:
-            raise RuntimeError("No connectors are registered.")
-
+    def publish(self, message: Message, connector_id: str | None = None) -> None:
+        if not self._started:
+            raise RuntimeError("Bridge is not running.")
         if connector_id is None:
             connector = next(iter(self._connectors.values()))
         else:
-            connector = self._connectors.get(connector_id)
-            if connector is None:
-                raise KeyError(f"Unknown connector_id: {connector_id}")
-
+            try:
+                connector = self._connectors[connector_id]
+            except KeyError:
+                raise KeyError(f"Unknown connector_id: {connector_id}") from None
         connector.publish(message)
 
-    def start(self):
+    def _enqueue(self, message: Message) -> None:
+        """Runs on the broker client's network thread: enqueue and return."""
+        q = self._queue
+        if q is None:
+            return
+        try:
+            q.put_nowait(message)
+        except queue.Full:
+            self._dropped += 1
+            log.warning("Dispatch queue full; dropping message on %s", message.topic)
 
+    def _run(self) -> None:
+        q = self._queue
+        while not self._stop.is_set():
+            try:
+                message = q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            self._dispatch(message)
+
+    def _dispatch(self, message: Message) -> None:
+        with self._lock:
+            routes = [r for r in self._routes if r.matches(message.topic)]
+        if not routes:
+            log.debug("No route for %s", message.topic)
+            return
+        for route in routes:
+            try:
+                route.handler(message)
+            except Exception:
+                log.exception("Handler %s failed for %s", route.handler_name, message.topic)
+
+    # ------------------------------------------------------------- lifecycle
+
+    def start(self) -> "Bridge":
         if self._started:
             raise RuntimeError("Bridge is already running.")
 
-        self._init_db()
-        self._init_thread_pool()
-
-        connectors = self._init_connectors()
+        self._stop.clear()
+        self._dropped = 0
+        self._queue = queue.Queue(maxsize=self._queue_size)
+        self._table.open()
+        self._thread = threading.Thread(target=self._run, name="bridge-dispatch", daemon=True)
+        self._thread.start()
 
         try:
-            for connector in connectors:
+            for connector_id, connector in self._connectors.items():
+                kind = type(connector).__name__
+                self._table.set_connector(connector_id, "registered", kind)
+                connector.on_message(self._enqueue)
+                try:
+                    connector.connect()
+                except Exception:
+                    self._table.set_connector(connector_id, "error", kind)
+                    raise
+                self._table.set_connector(connector_id, "running", kind)
 
-                connector_id = self.register(connector)
+            with self._lock:
+                for route in self._routes:
+                    self._table.add_route(route)
+                for topic in dict.fromkeys(r.topic for r in self._routes):
+                    self._sync_subscription(topic)
+                self._started = True
 
-                future = self._thread_pool.submit(
-                    self._sync,
-                    connector_id,
-                    connector
-                )
-
-                self._futures[connector_id] = future
-
-            self._num_active_connectors = len(connectors)
-            self._started = True
-
+            if self._tuner is not None:
+                self._tuner.start(self)
+                self._tuner_started = True
         except Exception:
             self.close()
             raise
-
         return self
 
-    def close(self):
+    def close(self) -> None:
+        """Stop everything. Safe to call more than once, and after a failed start."""
+        self._stop.set()
 
-        self._stop_event.set()
-
-        for connector in self._connectors.values():
+        for connector_id, connector in self._connectors.items():
             try:
                 connector.disconnect()
             except Exception:
-                log.exception("Error closing connector.")
+                log.exception("Error closing connector %s.", connector_id)
+            self._table.set_connector(connector_id, "stopped")
 
-        if self._thread_pool is not None:
-            self._thread_pool.shutdown(
-                wait=True,
-                cancel_futures=True
-            )
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                log.warning("Dispatch thread did not stop in time (a handler is still running).")
 
-        self._num_active_connectors = 0
-        self._started = False
+        if self._tuner is not None and self._tuner_started:
+            try:
+                self._tuner.stop()
+            except Exception:
+                log.exception("Error stopping tuner.")
+            self._tuner_started = False
 
-        if self._db_conn is not None:
-            self._db_conn.close()
-            self._db_conn = None
+        self._table.close()
+        with self._lock:
+            self._subscribed.clear()
+            self._started = False
+        self._queue = None
+        self._thread = None
 
-        self._thread_pool = None
-        self._connectors.clear()
-        self._futures.clear()
-
-    def __enter__(self):
-
+    def __enter__(self) -> "Bridge":
         return self.start()
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         self.close()
-
         return False
