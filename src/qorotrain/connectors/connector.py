@@ -1,6 +1,8 @@
 import logging
 import threading
+import time
 import uuid
+from collections import deque
 from abc import ABC, abstractmethod
 from typing import Callable
 
@@ -43,6 +45,10 @@ class Connector(ABC):
     @abstractmethod
     def on_message(self, callback: MessageCallback) -> None: ...
 
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until published messages are acknowledged. True if all were (or nothing to wait for)."""
+        return True
+
     def __enter__(self):
         self.connect()
         return self
@@ -59,6 +65,7 @@ class MQTTConnector(Connector):
         self._subs: dict[str, int] = {}
         self._subs_lock = threading.Lock()
         self._callback: MessageCallback | None = None
+        self._inflight: deque = deque(maxlen=10_000)  # publishes with qos > 0, awaiting ack
 
         self._connack = threading.Event()
         self._connect_error: str | None = None
@@ -133,13 +140,26 @@ class MQTTConnector(Connector):
         if msg.headers:
             props = Properties(PacketTypes.PUBLISH)
             props.UserProperty = list(msg.headers.items())
-        self._client.publish(
-            msg.topic,
-            msg.payload,
-            qos=self._cfg.qos if msg.qos is None else msg.qos,
-            retain=msg.retain,
-            properties=props,
+        qos = self._cfg.qos if msg.qos is None else msg.qos
+        info = self._client.publish(
+            msg.topic, msg.payload, qos=qos, retain=msg.retain, properties=props
         )
+        if qos > 0:
+            self._inflight.append(info)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        deadline = time.monotonic() + timeout
+        ok = True
+        while self._inflight:
+            info = self._inflight.popleft()
+            try:
+                info.wait_for_publish(timeout=max(0.0, deadline - time.monotonic()))
+            except (RuntimeError, ValueError):
+                ok = False
+                continue
+            if not info.is_published():
+                ok = False
+        return ok
 
     # ------------------------------------------------- paho callbacks (network thread)
 

@@ -58,25 +58,27 @@ Training notebook ──metrics/status──▶ [ Mosquitto ] ◀──▶ Conne
 
 | Component | Responsibility |
 |---|---|
-| **Telemetry client** | Small library used inside the notebook. Publishes metrics, parameters, and status. No ML dependencies. |
+| **Tracker** | Small client used inside the notebook. Buffers and publishes metric batches without blocking training, and does nothing outside `qorotrainctl`. |
 | **Connector** | Broker abstraction. `MQTTConnector` (Paho) is implemented; RabbitMQ and Kafka are out of scope for now. |
 | **Bridge** | Manages connectors, keeps the routing table in SQLite, and delivers messages to tuners. |
 | **Tuner** | Collects and summarizes telemetry, calls its tuning algorithm, validates proposals, and publishes start commands. |
 | **Tuning algorithm** | Decides what to try next from the trial history. |
-| **Runner** | Receives start commands and executes the notebook with the given parameters (Papermill). |
+| **Runner** | Receives start commands, runs the notebook with the given parameters as a Papermill subprocess, and reports the run's status (started, finished, failed, stopped). |
 
 ### Topics
 
-| Topic | Purpose | QoS |
-|---|---|---|
-| `tuning/<project>/<run>/status` | Run lifecycle events | 1 |
-| `tuning/<project>/<run>/metrics` | Streamed metric points | 0/1 |
-| `tuning/<project>/<run>/config` | Parameters of the run | 1 |
-| `tuning/<project>/<run>/alert` | Derived events (plateau, divergence) | 1 |
-| `tuning/<project>/<run>/proposal` | Proposal and rationale | 1 |
-| `tuning/<project>/command/start` | Start command for the runner | 1 |
+| Topic | Published by | Purpose | QoS |
+|---|---|---|---|
+| `tuning/<project>/command/start` | Tuner | Start a run with these parameters | 1 |
+| `tuning/<project>/command/stop` | Tuner | Stop a run | 1 |
+| `tuning/<project>/<run>/status` | Runner | `started`, `finished`, `failed`, `stopped` | 1 |
+| `tuning/<project>/<run>/metrics` | Tracker | Batches of metric points | 1 |
+| `tuning/<project>/<run>/alert` | Collector (*planned*) | Plateau and divergence events | 1 |
+| `tuning/<project>/<run>/proposal` | Tuner (*planned*) | Proposal and rationale, for review | 1 |
 
-Crashed runs are detected through the MQTT Last Will.
+Payloads are versioned JSON (`messages/schema.py`). Decoding is strict, so malformed messages are rejected in one place.
+
+Run status comes from the Runner, which is the parent of the notebook process and knows its exit code. This works even if the notebook crashes hard or never calls `tracker.finish()`. The Tracker only sends metrics.
 
 ## Quick start (*planned interface*)
 
@@ -115,19 +117,18 @@ num_episodes = 300
 seed = 31
 ```
 
-Add the telemetry calls. The runner passes the run ID and broker address through environment variables (`QOROTRAIN_RUN_ID`, `QOROTRAIN_BROKER`), so the tracker needs no arguments.
+Add the telemetry calls. The runner passes the run ID and broker address through environment variables (`QOROTRAIN_RUN_ID`, `QOROTRAIN_BROKER`, ...), so the tracker needs no arguments. Outside `qorotrainctl` those are missing and the tracker does nothing, so the notebook still runs on its own. `with Tracker() as tracker:` flushes even when the notebook raises. The notebook's kernel must be able to `import qorotrain`.
 
 ```python
 from qorotrain import Tracker
 
 tracker = Tracker()
-tracker.start(params={"learning_rate": learning_rate, "gamma": gamma})
 
 for ep in range(num_episodes):
     ...
-    tracker.log(step=ep, reward=total_reward, loss=avg_loss, epsilon=epsilon)
+    tracker.log(ep, reward=total_reward, loss=avg_loss, epsilon=epsilon)
 
-tracker.finish()
+tracker.finish()  # optional: also runs at exit
 ```
 
 ### 3. Describe the experiment
@@ -168,7 +169,6 @@ application:
   log_level: info                   # info | debug
 
 bridge:
-  workers: 4                        # dispatch workers
   topic_root: tuning
   connectors:                       # a pool; more than one is allowed
     - name: local-mqtt
@@ -178,8 +178,6 @@ bridge:
       username: ${MQTT_USER}        # optional
       password: ${MQTT_PASSWORD}
       default_qos: 1                # client_id is generated if omitted
-  routes:                           # optional per-handler overrides
-    - {handler: tuner.on_metrics, qos: 0, batch: 200}
 
 store:
   path: ./qorotrain.db
@@ -256,7 +254,7 @@ Results will be added once the experiments are complete.
 qorotrain/
 ├── cli/           # qorotrainctl (run, validate)
 ├── config/        # YAML schema (Pydantic models), loader, notebook validation
-├── client/        # telemetry client (Tracker)
+├── trackers/      # Tracker (used inside the notebook)
 ├── connectors/    # Connector base class, MQTTConnector
 ├── bridge/        # Bridge, routing table, subscription registry
 ├── collector/     # micro-batching, incremental summaries
@@ -270,11 +268,11 @@ qorotrain/
 
 ## Roadmap
 
-- [ ] YAML schema, loader, and `validate` command
-- [ ] Telemetry client and Mosquitto setup
-- [ ] Connector, bridge, and SQLite routing table
+- [x] YAML schema, loader, and `validate` command
+- [x] Telemetry client and Mosquitto setup
+- [x] Connector, bridge, and SQLite routing table
 - [ ] Collector with micro-batching and incremental summaries
-- [ ] Runner with Papermill parameter injection
+- [x] Runner with Papermill parameter injection
 - [ ] Tuner with random-search baseline
 - [ ] LLM agent algorithm with human review
 - [ ] Optuna baseline
@@ -290,9 +288,6 @@ qorotrain/
 - `paho-mqtt` 2.x (callbacks take a `CallbackAPIVersion` argument)
 - An LLM backend for the agent: a hosted model or a local model through Ollama
 
-## License
-
-TODO: choose a license (for example MIT) and add a `LICENSE` file.
 
 ## Author
 

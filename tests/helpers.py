@@ -7,8 +7,13 @@ from qorotrain.messages.message import Message
 class FakeConnector(Connector):
     """In-memory connector: records calls and lets a test deliver messages."""
 
-    def __init__(self, fail_connect: bool = False) -> None:
+    def __init__(self, fail_connect: bool = False, loopback: bool = False) -> None:
         self.fail_connect = fail_connect
+        self.loopback = loopback  # deliver our own publishes back, as a broker does for subscribers
+        self.flushed: list[float] = []
+        self.flush_result = True
+        self.publish_error: Exception | None = None
+        self.calls: list[str] = []  # order of publish / flush / disconnect
         self.connected = False
         self.subscribed: list[tuple[str, int | None]] = []
         self.unsubscribed: list[str] = []
@@ -21,10 +26,21 @@ class FakeConnector(Connector):
         self.connected = True
 
     def disconnect(self) -> None:
+        self.calls.append("disconnect")
         self.connected = False
 
     def publish(self, msg: Message) -> None:
+        if self.publish_error is not None:
+            raise self.publish_error
+        self.calls.append("publish")
         self.published.append(msg)
+        if self.loopback and self._callback is not None:
+            self._callback(msg)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        self.calls.append("flush")
+        self.flushed.append(timeout)
+        return self.flush_result
 
     def subscribe(self, topic: str, qos: int | None = None) -> None:
         self.subscribed.append((topic, qos))

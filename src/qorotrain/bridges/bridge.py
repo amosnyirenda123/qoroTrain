@@ -1,24 +1,32 @@
 import logging
 import queue
 import threading
+from dataclasses import dataclass
 from typing import Mapping, Sequence
 
+from .component import Component
 from .table import BridgeTable
 from ..connectors.config import BrokerConfig
 from ..connectors.connector import Connector
 from ..connectors.factory import create_connector
 from ..messages.message import Message
 from ..routes.route import Route
-from ..tuners.tuner import Tuner
 
 log = logging.getLogger(__name__)
 
 
+@dataclass
+class _Attached:
+    component: Component
+    routes: list[Route]
+    started: bool = False
+
+
 class Bridge:
-    """Coordinates connectors, routing and tuner communication.
+    """Coordinates connectors, routing and the components it hosts (Tuner, Runner...).
 
     Incoming path:  connector (network thread) -> queue -> dispatch thread -> route handlers
-    Outgoing path:  tuner -> ``Bridge.publish`` -> connector
+    Outgoing path:  component -> ``Bridge.publish`` -> connector
 
     Connectors call back on the broker client's network thread, so the only
     work done there is putting the message on a queue. Handlers (which may be
@@ -27,12 +35,12 @@ class Bridge:
     A message that matches several routes is delivered to all of them.
     When the queue is full, new messages are dropped and counted in ``dropped``.
     """
-    
+
     def __init__(
         self,
         connectors: Mapping[str, Connector] | Sequence[Connector],
         routes: Sequence[Route] | None = None,
-        tuner: Tuner | None = None,
+        components: Sequence[Component] | None = None,
         db_path: str = "bridge.db",
         queue_size: int = 10_000,
     ) -> None:
@@ -54,14 +62,12 @@ class Bridge:
         self._stop = threading.Event()
         self._dropped = 0
 
-        self._tuner: Tuner | None = None
-        self._tuner_routes: list[Route] = []
-        self._tuner_started = False
+        self._attached: list[_Attached] = []
 
         self._started = False
 
-        if tuner is not None:
-            self.attach(tuner)
+        for component in components or []:
+            self.attach(component)
 
     @classmethod
     def from_config(
@@ -135,29 +141,28 @@ class Bridge:
             connector.subscribe(topic, qos)
         self._subscribed[topic] = qos
 
-    # ----------------------------------------------------------------- tuner
+    # ------------------------------------------------------------ components
 
-    def attach(self, tuner: Tuner) -> "Bridge":
-        if self._tuner is not None:
-            raise RuntimeError("A tuner is already attached; detach it first.")
-        self._tuner = tuner
-        self._tuner_routes = [self.add_route(r) for r in tuner.routes()]
+    def attach(self, component: Component) -> "Bridge":
+        """Host a component (a Tuner, a Runner...): register its routes and, once running, start it."""
+        if any(a.component is component for a in self._attached):
+            raise RuntimeError("This component is already attached.")
+        attached = _Attached(component, [self.add_route(r) for r in component.routes()])
+        self._attached.append(attached)
         if self._started:
-            tuner.start(self)
-            self._tuner_started = True
+            component.start(self)
+            attached.started = True
         return self
 
-    def detach(self) -> None:
-        tuner = self._tuner
-        if tuner is None:
+    def detach(self, component: Component) -> None:
+        attached = next((a for a in self._attached if a.component is component), None)
+        if attached is None:
             return
-        for route in self._tuner_routes:
+        for route in attached.routes:
             self.drop_route(route)
-        if self._tuner_started:
-            tuner.stop()
-        self._tuner = None
-        self._tuner_routes = []
-        self._tuner_started = False
+        if attached.started:
+            component.stop()
+        self._attached.remove(attached)
 
     # ------------------------------------------------------------- messaging
 
@@ -237,9 +242,9 @@ class Bridge:
                     self._sync_subscription(topic)
                 self._started = True
 
-            if self._tuner is not None:
-                self._tuner.start(self)
-                self._tuner_started = True
+            for attached in self._attached:
+                attached.component.start(self)
+                attached.started = True
         except Exception:
             self.close()
             raise
@@ -262,12 +267,13 @@ class Bridge:
             if thread.is_alive():
                 log.warning("Dispatch thread did not stop in time (a handler is still running).")
 
-        if self._tuner is not None and self._tuner_started:
-            try:
-                self._tuner.stop()
-            except Exception:
-                log.exception("Error stopping tuner.")
-            self._tuner_started = False
+        for attached in reversed(self._attached):
+            if attached.started:
+                try:
+                    attached.component.stop()
+                except Exception:
+                    log.exception("Error stopping %s.", type(attached.component).__name__)
+                attached.started = False
 
         self._table.close()
         with self._lock:
