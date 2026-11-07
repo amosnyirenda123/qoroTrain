@@ -1,3 +1,19 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_validate_init.py
+
+Description:
+    Tests of :func:`~qorotrain.config.validate.validate_experiment` (errors
+    versus warnings for notebook, parameters, objective, algorithm and broker
+    checks) and of ``qorotrainctl init``'s generator
+    (:func:`~qorotrain.config.init.classify` heuristics and loadability of the
+    generated file).
+
+===============================================================================
+"""
 import socket
 
 import pytest

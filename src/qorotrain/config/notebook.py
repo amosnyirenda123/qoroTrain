@@ -1,6 +1,31 @@
-"""Read a notebook without running it.
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: qorotrain/config/notebook.py
 
-Everything here works on source text with ``ast``: no cell is ever executed.
+Description:
+    Read a notebook without running it.
+
+    Everything here works on source text with ``ast``: no cell is ever executed.
+
+    Qorotrain injects parameters with Papermill, which appends a cell of
+    assignments after the cell tagged ``parameters``. Injection only works if
+    that tagged cell contains nothing but plain literal assignments: anything
+    derived (``hidden = 2 * width``) would be computed from the *old* value.
+    :func:`parse_parameters` therefore extracts the literal values and reports
+    every other statement as a problem, with its line number.
+
+    The module also provides cheap static checks used by
+    :mod:`qorotrain.config.validate`: whether the notebook imports
+    ``qorotrain`` and which metric names it passes to ``.log(...)`` calls.
+
+    IPython syntax:
+        Lines starting with ``%`` or ``!`` (magics and shell escapes) are
+        blanked before parsing, keeping line numbers aligned with the cell.
+
+===============================================================================
 """
 import ast
 import re
@@ -11,6 +36,7 @@ from typing import Any
 import nbformat
 
 PARAMETERS_TAG = "parameters"
+"""Papermill's cell tag marking the cell whose assignments may be overridden."""
 
 _MAGIC = re.compile(r"^\s*[%!]")
 _IMPORT_QOROTRAIN = re.compile(r"^\s*(?:import|from)\s+qorotrain\b", re.MULTILINE)
@@ -38,6 +64,19 @@ class NotebookError(Exception):
 
 @dataclass
 class ParametersCell:
+    """What was found in the cell tagged ``parameters``.
+
+    Attributes:
+        cell_index (int | None): Index of the tagged cell among *all* cells
+            (markdown included), or ``None`` if no cell is tagged.
+        values (dict[str, Any]): Name to literal value, for every assignment
+            whose right-hand side ``ast.literal_eval`` accepts.
+        assigned (set[str]): Every simple name assigned in the cell, literal
+            or not.
+        problems (list[str]): One ``"line N: reason: code"`` entry per
+            statement that is not a plain literal assignment.
+    """
+
     cell_index: int | None = None
     values: dict[str, Any] = field(default_factory=dict)  # name -> literal value
     assigned: set[str] = field(default_factory=set)  # every name assigned in the cell
@@ -45,20 +84,43 @@ class ParametersCell:
 
     @property
     def found(self) -> bool:
+        """``True`` if the notebook has a cell tagged ``parameters``."""
         return self.cell_index is not None
 
 
 @dataclass
 class NotebookInfo:
+    """Static summary of a notebook.
+
+    Attributes:
+        path (pathlib.Path): The notebook file.
+        code_cells (list[str]): Source of every code cell, in order.
+        parameters (ParametersCell): Analysis of the ``parameters`` cell.
+    """
+
     path: Path
     code_cells: list[str]
     parameters: ParametersCell
 
     def imports_qorotrain(self) -> bool:
+        """Tell whether any code cell starts a line with ``import qorotrain`` or ``from qorotrain``.
+
+        Returns:
+            ``True`` if such an import is found (a regular-expression check,
+            not a full parse).
+        """
         return any(_IMPORT_QOROTRAIN.search(src) for src in self.code_cells)
 
     def logged_metrics(self) -> set[str]:
-        """Keyword names passed to any ``<obj>.log(...)`` call (``step`` excluded)."""
+        """Keyword names passed to any ``<obj>.log(...)`` call (``step`` excluded).
+
+        Cells that do not parse are skipped. The check is purely syntactic:
+        any method named ``log`` counts, and metrics passed through
+        ``**kwargs`` are invisible.
+
+        Returns:
+            The metric names found.
+        """
         names: set[str] = set()
         for source in self.code_cells:
             try:
@@ -93,6 +155,7 @@ def _target(node: ast.stmt) -> tuple[str, ast.expr] | None:
 
 
 def _explain(value: ast.expr) -> str:
+    """Say why a right-hand side is not a literal: a call, a reference to other names, or other."""
     if any(isinstance(n, ast.Call) for n in ast.walk(value)):
         return "function call"
     if any(isinstance(n, ast.Name) for n in ast.walk(value)):
@@ -101,6 +164,7 @@ def _explain(value: ast.expr) -> str:
 
 
 def _problem(text: str, node: ast.stmt, reason: str) -> str:
+    """Format a problem as ``line N: reason: snippet``, truncating long or multi-line code to 60 characters."""
     segment = (ast.get_source_segment(text, node) or "").strip().splitlines()
     snippet = segment[0] if segment else ""
     if len(snippet) > 60 or len(segment) > 1:
@@ -109,7 +173,18 @@ def _problem(text: str, node: ast.stmt, reason: str) -> str:
 
 
 def parse_parameters(source: str) -> ParametersCell:
-    """Collect literal assignments; report every other statement as a problem."""
+    """Collect literal assignments; report every other statement as a problem.
+
+    Only top-level statements are examined. A syntax error is reported as a
+    single problem rather than raised.
+
+    Args:
+        source: Source code of the ``parameters`` cell.
+
+    Returns:
+        The analysis, with ``cell_index`` left as ``None`` (the caller sets
+        it).
+    """
     cell = ParametersCell()
     text = _clean(source)
     try:
@@ -134,6 +209,22 @@ def parse_parameters(source: str) -> ParametersCell:
 
 
 def read_notebook(path: str | Path) -> NotebookInfo:
+    """Load a notebook file and analyse it statically.
+
+    If several cells are tagged ``parameters``, the first is analysed and an
+    extra problem is recorded (Papermill's behaviour with several tagged cells
+    is not what users expect).
+
+    Args:
+        path: Path of an ``.ipynb`` file.
+
+    Returns:
+        The notebook summary.
+
+    Raises:
+        NotebookError: If the file does not exist, does not have the
+            ``.ipynb`` suffix, or cannot be parsed by ``nbformat``.
+    """
     path = Path(path)
     if not path.exists():
         raise NotebookError(f"notebook not found: {path}")

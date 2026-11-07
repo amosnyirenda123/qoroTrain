@@ -1,3 +1,18 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_tracker.py
+
+Description:
+    Tests of :class:`~qorotrain.trackers.tracker.Tracker` with a fake connector:
+    enabling from the environment, connection failures, micro-batching by size
+    and time, ``finish`` semantics and ``atexit`` registration, value coercion,
+    and the guarantee that telemetry errors never reach the training code.
+
+===============================================================================
+"""
 import math
 import warnings
 

@@ -1,3 +1,18 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_factory.py
+
+Description:
+    Tests of :mod:`qorotrain.tuners.factory`: which Tuner subclass is built for
+    each algorithm, how seed, grid points, initial values and overrides reach
+    it, manual review requiring a reviewer, unavailable algorithms, and reading
+    the baseline from the ``parameters`` cell.
+
+===============================================================================
+"""
 import pytest
 
 from nbhelpers import good_notebook, write_notebook

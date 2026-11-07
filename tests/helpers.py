@@ -1,3 +1,22 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/helpers.py
+
+Description:
+    Shared test doubles for the messaging layer.
+
+    ``FakeConnector`` is an in-memory
+    :class:`~qorotrain.connectors.connector.Connector` that records subscribe,
+    publish, flush and disconnect calls, can fail on connect or publish, can
+    loop published messages back like a broker, and lets a test inject messages
+    with ``deliver`` as if they arrived on the network thread. ``wait_for``
+    polls a predicate, for assertions about work done on background threads.
+
+===============================================================================
+"""
 import time
 
 from qorotrain.connectors.connector import Connector

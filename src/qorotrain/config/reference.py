@@ -1,27 +1,58 @@
-"""Reference documentation of ``experiment.yaml``, generated from the schema models.
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: qorotrain/config/reference.py
 
-The schema (``models.py``) is the single source of truth for keys, types, defaults and
-constraints. This module adds the one thing the schema cannot know: what each key *means*.
-``tests/test_reference.py`` fails when a key exists without a description (or the other way
-round), so the documentation cannot silently fall behind the code.
+Description:
+    Reference documentation of ``experiment.yaml``, generated from the schema models.
 
-Regenerate the checked-in page with::
+    The schema (``models.py``) is the single source of truth for keys, types, defaults and
+    constraints. This module adds the one thing the schema cannot know: what each key *means*.
+    ``tests/test_reference.py`` fails when a key exists without a description (or the other way
+    round), so the documentation cannot silently fall behind the code.
 
-    python -m qorotrain.config.reference > docs/experiment-yaml-reference.md
+    Regenerate the checked-in page with::
+
+        python -m qorotrain.config.reference > docs/experiment-yaml-reference.md
+
+    How it works:
+        :func:`fields` walks the Pydantic model tree recursively
+        (sections, lists of sections such as ``bridge.connectors[]``, and
+        mappings of sections such as ``job.hyperparameters.<name>``), derives
+        a readable type, constraint and default text for every key from the
+        field metadata, and pairs it with its :class:`Entry` in
+        :data:`DESCRIPTIONS`. :func:`render_markdown` groups the result by
+        top-level section into pipe tables.
+
+===============================================================================
 """
 import types
 from dataclasses import dataclass
 from typing import Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel
+from pydantic.fields import FieldInfo
 
 from .models import ExperimentSpec
 
 ACTIVE, RESERVED, LABEL = "active", "reserved", "label"
+"""Possible values of ``Entry.status``. In order, the key is read by the code, validated but not read yet, or shown in messages only."""
 
 
 @dataclass(frozen=True)
 class Entry:
+    """Human-written description of one ``experiment.yaml`` key.
+
+    Attributes:
+        meaning (str): What the key does, in Markdown.
+        status (str): :data:`ACTIVE`, :data:`RESERVED` (rendered with a
+            "Not used yet." prefix) or :data:`LABEL` ("Label only.").
+        required (str | None): Text that replaces the computed default
+            column, for keys whose requirement is conditional.
+    """
+
     meaning: str
     status: str = ACTIVE  # active: read by the code. reserved: validated but unused. label: only shown in messages
     required: str | None = None  # overrides the computed "required" / "optional"
@@ -132,8 +163,10 @@ DESCRIPTIONS: dict[str, Entry] = {
         "The value here replaces the notebook's own value in every run."
     ),
 }
+"""Description of every ``experiment.yaml`` key, by dotted path (``[]`` for list items, ``<name>`` for mapping entries)."""
 
 SECTION_ORDER = ["version", "application", "bridge", "store", "tuner", "runner", "job"]
+"""Order of the top-level sections in the rendered page."""
 
 
 # --------------------------------------------------------------- introspection
@@ -141,6 +174,17 @@ SECTION_ORDER = ["version", "application", "bridge", "store", "tuner", "runner",
 
 @dataclass(frozen=True)
 class FieldDoc:
+    """One row of the reference: a key with its derived type and default.
+
+    Attributes:
+        path (str): Dotted key path, for example ``tuner.stop.patience``.
+        type_text (str): Readable type with constraints.
+        default_text (str): Readable default, ``required`` or
+            ``section is optional``.
+        entry (Entry): The human-written description (empty if missing).
+        is_section (bool): Whether the key holds nested keys.
+    """
+
     path: str
     type_text: str
     default_text: str
@@ -148,7 +192,8 @@ class FieldDoc:
     is_section: bool
 
 
-def _unwrap_optional(annotation):
+def _unwrap_optional(annotation: Any) -> tuple[Any, bool]:
+    """Strip ``None`` from ``X | None``; return the inner type and whether it was optional."""
     if get_origin(annotation) in (Union, types.UnionType):
         args = [a for a in get_args(annotation) if a is not type(None)]
         if len(args) == 1:
@@ -156,11 +201,13 @@ def _unwrap_optional(annotation):
     return annotation, False
 
 
-def _is_model(annotation) -> bool:
+def _is_model(annotation: Any) -> bool:
+    """Tell whether an annotation is a Pydantic model class (a nested section)."""
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 
 
-def _scalar_type(annotation) -> str:
+def _scalar_type(annotation: Any) -> str:
+    """Describe a non-section annotation in plain words (``integer``, ``one of `a`, `b```...)."""
     origin = get_origin(annotation)
     if origin is Literal:
         return "one of " + ", ".join(f"`{v}`" for v in get_args(annotation))
@@ -176,7 +223,8 @@ def _scalar_type(annotation) -> str:
     )
 
 
-def _constraints(field) -> str:
+def _constraints(field: FieldInfo) -> str:
+    """Describe a field's numeric and length constraints (``at least 1, at most 65535``)."""
     parts = []
     for meta in field.metadata:
         for attr, text in (("ge", "at least {}"), ("gt", "greater than {}"), ("le", "at most {}"), ("lt", "less than {}")):
@@ -189,7 +237,8 @@ def _constraints(field) -> str:
     return ", ".join(parts)
 
 
-def _default_text(field) -> str:
+def _default_text(field: FieldInfo) -> str:
+    """Describe a field's default value as shown in the reference table."""
     if field.is_required():
         return "required"
     if field.default_factory is not None:
@@ -210,6 +259,14 @@ def _default_text(field) -> str:
 
 
 def _walk(model: type[BaseModel], prefix: str, out: list[FieldDoc]) -> None:
+    """Append a :class:`FieldDoc` for every field of ``model``, recursing into nested sections.
+
+    Args:
+        model: Model class to walk.
+        prefix: Path prefix of the model's fields (ends with ``.``, ``[].``
+            or ``.<name>.``, or is empty at the root).
+        out: Accumulator; mutated.
+    """
     for name, field in model.model_fields.items():
         path = f"{prefix}{name}"
         annotation, _ = _unwrap_optional(field.annotation)
@@ -247,7 +304,11 @@ def _walk(model: type[BaseModel], prefix: str, out: list[FieldDoc]) -> None:
 
 
 def fields() -> list[FieldDoc]:
-    """Every key of ``experiment.yaml``, in schema order, with its type, default and description."""
+    """Every key of ``experiment.yaml``, in schema order, with its type, default and description.
+
+    Returns:
+        One entry per key, parents before children.
+    """
     out: list[FieldDoc] = []
     _walk(ExperimentSpec, "", out)
     return out
@@ -257,16 +318,23 @@ def fields() -> list[FieldDoc]:
 
 
 def _cell(text: str) -> str:
+    """Escape text for a Markdown table cell (pipes escaped, newlines flattened)."""
     return text.replace("|", "\\|").replace("\n", " ")
 
 
 def _what_it_does(doc: FieldDoc) -> str:
+    """The description column: the meaning, prefixed according to the entry status."""
     prefix = {RESERVED: "**Not used yet.** ", LABEL: "**Label only.** "}.get(doc.entry.status, "")
     return prefix + doc.entry.meaning
 
 
 def render_markdown() -> str:
-    """The key-by-key reference as Notion-compatible Markdown (pipe tables)."""
+    """The key-by-key reference as Notion-compatible Markdown (pipe tables).
+
+    Returns:
+        The page text, one ``## `section``` heading and table per top-level
+        section, ending with a single newline.
+    """
     docs = fields()
     by_section: dict[str, list[FieldDoc]] = {s: [] for s in SECTION_ORDER}
     for doc in docs:

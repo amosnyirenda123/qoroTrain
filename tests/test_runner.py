@@ -1,3 +1,21 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_runner.py
+
+Description:
+    Tests of :class:`~qorotrain.runners.runner.Runner` on a real Bridge with a
+    fake connector. ``ScriptRunner`` replaces Papermill with small Python
+    scripts so that exit codes, signals, slow and SIGTERM-resistant processes
+    can be simulated. Covers status sequencing, the params file, the notebook
+    environment, failure tails, duplicate and concurrent start commands,
+    stopping (including child processes and SIGKILL escalation) and
+    ``from_spec``.
+
+===============================================================================
+"""
 import json
 import os
 import sys

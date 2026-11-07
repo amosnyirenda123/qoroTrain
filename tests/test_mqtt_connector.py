@@ -1,3 +1,19 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_mqtt_connector.py
+
+Description:
+    Unit tests of :class:`~qorotrain.connectors.connector.MQTTConnector` with
+    Paho's client replaced by a mock: client ids, credentials and Last Will,
+    CONNACK success/refusal/timeout, subscription replay on reconnect, publish
+    QoS, retain and headers as MQTT 5 user properties, conversion of incoming
+    messages, and isolation of callback exceptions.
+
+===============================================================================
+"""
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 

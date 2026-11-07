@@ -1,3 +1,19 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_config_loader.py
+
+Description:
+    Tests of :mod:`qorotrain.config.loader` and the schema: defaults of a
+    minimal file, connector conversion to ``MQTTConfig``, file reading errors,
+    unknown and missing keys reported with their paths, all problems reported
+    together, YAML errors, duplicate keys, exponent floats, ``${ENV}``
+    substitution and the cross-field validation rules.
+
+===============================================================================
+"""
 import pytest
 
 from nbhelpers import experiment_yaml

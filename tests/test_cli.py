@@ -1,3 +1,18 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_cli.py
+
+Description:
+    Despite its name, this module tests the Bridge, not the command line: it is
+    a newer superset of ``test_bridge.py`` that adds component-lifecycle cases
+    (several components, start order and reverse stop order, attach while
+    running, failing component start).
+
+===============================================================================
+"""
 import threading
 
 import pytest

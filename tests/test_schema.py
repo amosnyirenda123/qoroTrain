@@ -1,3 +1,18 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_schema.py
+
+Description:
+    Tests of the wire contract in :mod:`qorotrain.config.contracts.schema`:
+    encode/decode round trips, NaN and infinity preservation, the version
+    envelope, strict rejection of malformed payloads, and the topic and pattern
+    helpers.
+
+===============================================================================
+"""
 import json
 import math
 

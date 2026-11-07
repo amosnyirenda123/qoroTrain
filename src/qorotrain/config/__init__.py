@@ -1,160 +1,53 @@
-"""Generate a starting ``experiment.yaml`` from a notebook.
-
-The ranges are guesses made from each parameter's current value. They are meant
-to be reviewed, so every guessed line carries a ``review`` comment.
 """
-import os
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: qorotrain/config/__init__.py
 
-import yaml
+Description:
+    Configuration subsystem: everything that happens to ``experiment.yaml``
+    and the notebook *before* anything runs.
 
-from .notebook import PARAMETERS_TAG, read_notebook
+    This package is a facade. It re-exports the names the CLI and library
+    users need, so they can write ``from qorotrain.config import
+    load_experiment`` without knowing the internal module layout:
 
-# Name tokens that usually mean "budget or identifier", not something to tune.
-_FIXED_TOKENS = {
-    "seed", "episode", "episodes", "epoch", "epochs", "plays", "timesteps",
-    "path", "dir", "file", "name", "device", "verbose", "debug", "render",
-    "workers", "jobs",
-    # sizes of the problem itself, not knobs of the training
-    "arms", "classes", "features", "actions", "states",
-}
+    - :mod:`~qorotrain.config.models`: the Pydantic schema
+      (:class:`~qorotrain.config.models.ExperimentSpec`).
+    - :mod:`~qorotrain.config.loader`: YAML parsing, ``${ENV}`` substitution
+      and schema validation (:func:`~qorotrain.config.loader.load_experiment`,
+      :class:`~qorotrain.config.loader.ConfigError`).
+    - :mod:`~qorotrain.config.validate`: cross-checks against the notebook and
+      the broker (:func:`~qorotrain.config.validate.validate_experiment`).
+    - :mod:`~qorotrain.config.notebook`: static notebook inspection
+      (:func:`~qorotrain.config.notebook.read_notebook`).
+    - :mod:`~qorotrain.config.init`: generation of a starting
+      ``experiment.yaml`` (:func:`~qorotrain.config.init.generate_experiment`).
+    - :mod:`~qorotrain.config.reference`: the key-by-key reference page.
+    - :mod:`~qorotrain.config.environment` and
+      :mod:`~qorotrain.config.contracts.schema`: the runtime contracts between
+      processes (environment variables and message payloads).
 
-# Name tokens that mean "a probability or a discount factor": the upper bound is 1.
-_PROBABILITY_TOKENS = {"epsilon", "eps", "prob", "probability", "dropout", "gamma", "discount"}
-
-
-class InitError(Exception):
-    """A starting file cannot be generated from this notebook."""
-
-
-@dataclass
-class Guess:
-    kind: str  # "float" | "int" | "fixed"
-    min: float | int | None = None
-    max: float | int | None = None
-    log: bool = False
-    reason: str = ""
-
-
-@dataclass
-class InitResult:
-    yaml: str
-    tuned: dict[str, Guess] = field(default_factory=dict)
-    fixed: dict[str, Any] = field(default_factory=dict)
-    problems: list[str] = field(default_factory=list)  # parameters-cell problems
-
-
-def _round(x: float) -> float:
-    return float(f"{x:.3g}")
-
-
-def classify(name: str, value: Any) -> Guess:
-    """Decide whether a parameter looks tunable, and propose a range if so."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return Guess("fixed")
-    tokens = set(name.lower().split("_"))
-    if _FIXED_TOKENS & tokens:
-        return Guess("fixed", reason="looks like a budget, an identifier or a problem size")
-
-    if isinstance(value, int):
-        if value < 2:
-            return Guess("fixed", reason="too small to guess a range")
-        return Guess("int", max(1, value // 2), value * 2)
-
-    if value <= 0:
-        return Guess("fixed", reason="cannot guess a range from a non-positive value")
-    if value >= 1 and _PROBABILITY_TOKENS & tokens:
-        return Guess("fixed", reason="a probability already at its upper bound")
-    if 0.8 <= value < 1:  # discount-factor-like
-        return Guess("float", _round(min(value, 0.9)), 0.999)
-    if value < 1:
-        return Guess("float", _round(value / 10), _round(min(value * 10, 1.0)), log=value < 0.1)
-    return Guess("float", _round(value / 10), _round(value * 10), log=True)
-
-
-def _num(x: float | int) -> str:
-    if isinstance(x, int):
-        return str(x)
-    text = repr(float(x))
-    mantissa, _, exponent = text.partition("e")
-    if exponent and "." not in mantissa:
-        text = f"{mantissa}.0e{exponent}"
-    return text
-
-
-def _inline(value: Any) -> str:
-    return yaml.safe_dump(value, default_flow_style=True, width=10_000).replace("\n...\n", "").strip()
-
-
-def _slug(stem: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-") or "experiment"
-
-
-def generate_experiment(notebook_path: str | Path, output_dir: str | Path = ".") -> InitResult:
-    notebook = read_notebook(notebook_path)
-    params = notebook.parameters
-    if not params.found:
-        raise InitError(
-            f"no cell is tagged '{PARAMETERS_TAG}' in {Path(notebook_path).name} "
-            "(JupyterLab: select the cell, open the right sidebar, Common Tools, Cell Tags)"
-        )
-    if not params.values:
-        raise InitError(
-            f"the '{PARAMETERS_TAG}' cell has no plain assignments to read; "
-            "keep only lines like `learning_rate = 0.001` in it"
-        )
-
-    result = InitResult(yaml="", problems=list(params.problems))
-    tuned_lines: list[str] = []
-    fixed_lines: list[str] = []
-
-    for name, value in params.values.items():
-        guess = classify(name, value)
-        if guess.kind == "fixed":
-            result.fixed[name] = value
-            note = f"  # review: kept fixed ({guess.reason})" if guess.reason else ""
-            fixed_lines.append(f"    {name}: {_inline(value)}{note}")
-        else:
-            result.tuned[name] = guess
-            log = ", log: true" if guess.log else ""
-            tuned_lines.append(
-                f"    {name}: {{type: {guess.kind}, min: {_num(guess.min)}, max: {_num(guess.max)}{log}}}"
-                f"  # review: guessed from {value!r}"
-            )
-
-    source = os.path.relpath(Path(notebook_path), Path(output_dir)).replace(os.sep, "/")
-    nb_name = Path(notebook_path).name
-    hyper_block = "\n".join(tuned_lines) if tuned_lines else "    {}  # TODO: nothing looked tunable"
-    fixed_block = "\n".join(fixed_lines) if fixed_lines else "    {}"
-
-    result.yaml = f"""\
-# Generated by `qorotrainctl init` from {nb_name}.
-# Lines marked "review" are guesses made from the notebook's current values.
-version: 1
-application: {{name: {_slug(Path(notebook_path).stem)}}}
-
-bridge:
-  connectors:
-    - {{type: mqtt, host: localhost, port: 1883}}
-
-tuner:
-  algorithm: random     # random | grid (the LLM agent and Optuna are not available yet)
-  max_runs: 8           # counts the baseline run, which uses the notebook's own values
-  seed: 0
-  review: {{mode: auto}}  # manual review is not available yet
-
-job:
-  source: {source}
-  objective:
-    metric: TODO          # a metric your notebook logs, e.g. reward
-    aggregate: last       # last | best | mean | mean_last_N
-    direction: maximize   # review
-  hyperparameters:        # what the tuner may change
-{hyper_block}
-  fixed:                  # passed to every run, never tuned
-{fixed_block}
+===============================================================================
 """
-    return result
+from .init import InitError, InitResult, generate_experiment
+from .loader import ConfigError, load_experiment, parse_experiment
+from .models import ExperimentSpec
+from .notebook import NotebookError, read_notebook
+from .validate import ValidationReport, resolve_source, validate_experiment
+
+__all__ = [
+    "ConfigError",
+    "ExperimentSpec",
+    "InitError",
+    "InitResult",
+    "NotebookError",
+    "ValidationReport",
+    "generate_experiment",
+    "load_experiment",
+    "parse_experiment",
+    "read_notebook",
+    "resolve_source",
+    "validate_experiment",
+]

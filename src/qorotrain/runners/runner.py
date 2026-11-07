@@ -1,18 +1,48 @@
-"""Runner: executes the notebook, one run at a time, and owns run lifecycle status.
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: qorotrain/runners/runner.py
 
-    Tuner --command/start--> Runner --subprocess (papermill)--> notebook (Tracker)
-                               |
-                               +--status: started, then finished | failed | stopped--> broker
+Description:
+    Runner: executes the notebook, one run at a time, and owns run lifecycle status.
 
-The Runner is the parent of the notebook process, so it knows how the run ended
-even if the notebook crashes hard or never calls ``tracker.finish()``. The
-Tracker owns telemetry; the Runner owns status. Each fact has one publisher.
+    .. code-block:: text
 
-Handlers must return quickly because the bridge dispatches on a single thread, so
-launching only spawns the process and a watcher thread waits for it.
+        Tuner --command/start--> Runner --subprocess (papermill)--> notebook (Tracker)
+                                   |
+                                   +--status: started, then finished | failed | stopped--> broker
 
-POSIX only: runs get their own process group so that stopping a run also stops
-anything the notebook spawned.
+    The Runner is the parent of the notebook process, so it knows how the run ended
+    even if the notebook crashes hard or never calls ``tracker.finish()``. The
+    Tracker owns telemetry; the Runner owns status. Each fact has one publisher.
+
+    Handlers must return quickly because the bridge dispatches on a single thread, so
+    launching only spawns the process and a watcher thread waits for it.
+
+    POSIX only: runs get their own process group so that stopping a run also stops
+    anything the notebook spawned.
+
+    Run artefacts:
+        For run ``<id>`` the Runner creates ``<output_dir>/<id>/`` containing
+        ``params.yaml`` (``job.fixed`` merged with the proposal, proposal
+        values winning), ``run.ipynb`` (the executed notebook written by
+        Papermill) and ``papermill.log`` (combined stdout/stderr). The
+        directory must not already exist, which enforces unique run ids.
+
+    Threading:
+        ``_on_start`` / ``_on_stop`` run on the Bridge's dispatch thread. Each
+        run gets a daemon watcher thread (``runner-<id>``) that waits for the
+        process and publishes the terminal status. Stopping uses a
+        ``threading.Timer`` to escalate from SIGTERM to SIGKILL. Shared state
+        (active run, seen ids) is guarded by a lock.
+
+    Idempotency:
+        MQTT QoS 1 can deliver a start command twice; run ids already seen are
+        ignored, so a duplicate never launches a second process.
+
+===============================================================================
 """
 import logging
 import os
@@ -61,6 +91,19 @@ _ERROR_TAIL_CHARS = 1000
 
 @dataclass
 class _Run:
+    """State of the active run.
+
+    Attributes:
+        id (str): Run identifier.
+        proc (subprocess.Popen): The Papermill process (leader of its own
+            process group).
+        log_path (Path): Path of ``papermill.log``.
+        thread (threading.Thread | None): Watcher thread, started after the
+            ``started`` status is published.
+        stopping (bool): Set when a stop was requested, so that the exit is
+            reported as ``stopped`` rather than ``failed``.
+    """
+
     id: str
     proc: subprocess.Popen
     log_path: Path
@@ -69,6 +112,18 @@ class _Run:
 
 
 class Runner:
+    """Bridge component that executes the notebook with Papermill on command.
+
+    Listens on the project's ``command/start`` and ``command/stop`` topics and
+    publishes ``<run>/status``. At most one run is active; a start command
+    received while busy is answered with a ``failed`` status.
+
+    The notebook process receives its identity and broker settings through
+    the ``QOROTRAIN_*`` environment variables
+    (:mod:`qorotrain.config.environment`), so its
+    :class:`~qorotrain.trackers.tracker.Tracker` needs no arguments.
+    """
+
     def __init__(
         self,
         source: str | Path,
@@ -86,6 +141,25 @@ class Runner:
         python: str | None = None,
         grace_seconds: float = 5.0,
     ) -> None:
+        """Configure the runner; nothing is launched until a start command arrives.
+
+        Args:
+            source: Notebook to execute.
+            project: Experiment name (topic segment and ``QOROTRAIN_PROJECT``).
+            output_dir: Parent directory of the per-run directories.
+            topic_root: Topic root.
+            broker: ``host:port`` handed to the notebook's Tracker.
+            username: Broker username handed to the notebook, or ``None``.
+            password: Broker password handed to the notebook, or ``None``.
+            fixed: Values merged into every run's parameters (overridden by
+                the start command's parameters).
+            kernel: Jupyter kernel name (Papermill ``-k``).
+            workdir: Kernel working directory (Papermill ``--cwd``).
+            timeout: Per-cell execution timeout, seconds.
+            python: Interpreter used to run ``-m papermill``; defaults to the
+                current interpreter.
+            grace_seconds: Delay between SIGTERM and SIGKILL when stopping.
+        """
         self._source = Path(source)
         self._project = project
         self._output_dir = Path(output_dir)
@@ -107,7 +181,18 @@ class Runner:
 
     @classmethod
     def from_spec(cls, spec: "ExperimentSpec", base_dir: str | Path = ".") -> "Runner":
-        """Build a runner from a loaded experiment.yaml; relative paths are relative to ``base_dir``."""
+        """Build a runner from a loaded experiment.yaml; relative paths are relative to ``base_dir``.
+
+        The notebook's broker settings come from the *first* connector in
+        ``bridge.connectors``.
+
+        Args:
+            spec: The loaded experiment.
+            base_dir: Directory of ``experiment.yaml``.
+
+        Returns:
+            A configured runner.
+        """
         base = Path(base_dir)
 
         def resolve(path: str) -> Path:
@@ -132,16 +217,31 @@ class Runner:
     # --------------------------------------------------------------- component
 
     def routes(self) -> list[Route]:
+        """Subscribe to the project's start and stop command topics at QoS 1.
+
+        Returns:
+            The two command routes.
+        """
         return [
             Route(start_topic(self._root, self._project), self._on_start, qos=1),
             Route(stop_topic(self._root, self._project), self._on_stop, qos=1),
         ]
 
     def start(self, bridge: "Bridge") -> None:
+        """Keep the Bridge to publish statuses with.
+
+        Args:
+            bridge: The running Bridge.
+        """
         self._bridge = bridge
 
     def stop(self) -> None:
-        """Stop the active run, if any, and wait for its watcher."""
+        """Stop the active run, if any, and wait for its watcher.
+
+        Waits at most ``grace_seconds + 2`` seconds for the watcher thread.
+        The terminal status is published only if the Bridge is still
+        reachable at that point.
+        """
         with self._lock:
             run = self._active
             if run is not None:
@@ -154,12 +254,20 @@ class Runner:
 
     @property
     def active_run(self) -> str | None:
+        """Identifier of the run currently executing, or ``None`` when idle."""
         with self._lock:
             return self._active.id if self._active else None
 
     # ---------------------------------------------------------------- handlers
 
     def _on_start(self, message: Message) -> None:
+        """Handle a start command (dispatch thread).
+
+        Malformed commands are logged and ignored; duplicate run ids are
+        ignored. If the runner is busy or the launch fails, a ``failed``
+        status is published. Otherwise ``started`` is published *before* the
+        watcher thread starts, so it always precedes the terminal status.
+        """
         try:
             command = decode_start(message.payload)
         except SchemaError as exc:
@@ -191,6 +299,7 @@ class Runner:
         run.thread.start()
 
     def _on_stop(self, message: Message) -> None:
+        """Handle a stop command (dispatch thread): terminate the run if it is the active one."""
         try:
             command = decode_stop(message.payload)
         except SchemaError as exc:
@@ -207,7 +316,17 @@ class Runner:
     # --------------------------------------------------------------- launching
 
     def _command(self, command: StartCommand, params_file: Path, output_notebook: Path) -> list[str]:
-        """The process to run. A method so tests can substitute a stand-in for papermill."""
+        """The process to run. A method so tests can substitute a stand-in for papermill.
+
+        Args:
+            command: The start command being executed.
+            params_file: YAML file with the run's parameters (Papermill
+                ``-f``).
+            output_notebook: Where Papermill writes the executed notebook.
+
+        Returns:
+            The ``argv`` of the Papermill invocation.
+        """
         argv = [
             self._python, "-m", "papermill",
             str(self._source.resolve()), str(output_notebook.resolve()),
@@ -221,6 +340,12 @@ class Runner:
         return argv
 
     def _environment(self, run: str) -> dict[str, str]:
+        """Environment of the notebook process: the parent's, plus the ``QOROTRAIN_*`` variables.
+
+        Credential variables are removed when no credential is configured,
+        so stale values inherited from the parent shell never reach the
+        notebook.
+        """
         env = os.environ.copy()
         env[ENV_RUN_ID] = run
         env[ENV_PROJECT] = self._project
@@ -234,6 +359,15 @@ class Runner:
         return env
 
     def _spawn(self, command: StartCommand) -> _Run:
+        """Create the run directory and parameter file, and start the process.
+
+        Returns:
+            The run, with its watcher thread created but not started.
+
+        Raises:
+            FileExistsError: If the run directory already exists.
+            OSError: If the process cannot be started.
+        """
         run_dir = self._output_dir / command.run
         run_dir.mkdir(parents=True, exist_ok=False)  # run ids must be unique
 
@@ -257,6 +391,12 @@ class Runner:
     # ---------------------------------------------------------------- watching
 
     def _watch(self, run: _Run) -> None:
+        """Watcher thread body: wait for the process and publish its terminal status.
+
+        Exit classification: a requested stop gives ``stopped``; exit code 0
+        gives ``finished``; anything else gives ``failed`` with the tail of
+        the log.
+        """
         returncode = run.proc.wait()
         with self._lock:
             stopping = run.stopping
@@ -277,6 +417,12 @@ class Runner:
 
     @staticmethod
     def _error_tail(run: _Run, returncode: int) -> str:
+        """Describe a failed exit: the exit code or signal, then the last non-blank log lines.
+
+        Reads at most the final 4,000 bytes of ``papermill.log`` and keeps the
+        last 12 non-blank lines, capped at 1,000 characters, which is usually
+        enough to include the Python traceback raised in the notebook.
+        """
         prefix = f"terminated by signal {-returncode}" if returncode < 0 else f"exit code {returncode}"
         try:
             with open(run.log_path, "rb") as f:
@@ -303,6 +449,7 @@ class Runner:
 
     @staticmethod
     def _kill(run: _Run) -> None:
+        """SIGKILL the run's process group if the process has not exited yet."""
         if run.proc.poll() is None:
             try:
                 os.killpg(os.getpgid(run.proc.pid), signal.SIGKILL)
@@ -312,6 +459,7 @@ class Runner:
     # -------------------------------------------------------------- publishing
 
     def _publish(self, status: Status) -> None:
+        """Publish a status at QoS 1; do nothing when detached, log (not raise) on failure."""
         bridge = self._bridge
         if bridge is None:
             return

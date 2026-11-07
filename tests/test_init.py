@@ -1,3 +1,16 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_init.py
+
+Description:
+    Older copy of the validation and ``init`` tests; ``test_validate_init.py``
+    is the current, larger version of the same cases.
+
+===============================================================================
+"""
 import socket
 
 import pytest

@@ -1,8 +1,47 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: qorotrain/bridges/bridge.py
+
+Description:
+    The Bridge: message hub between broker connectors and the components
+    (Tuner, Runner) of a tuning session.
+
+    The Bridge owns a pool of :class:`~qorotrain.connectors.connector.Connector`
+    objects, a list of :class:`~qorotrain.routes.route.Route` objects, and the
+    :class:`~qorotrain.bridges.component.Component` objects it hosts. It keeps
+    broker subscriptions in sync with the routes, decouples the brokers'
+    network threads from handler execution with a bounded queue, and mirrors
+    its state into a :class:`~qorotrain.bridges.table.BridgeTable`.
+
+    Design:
+        Mediator pattern. Components never talk to connectors or to each
+        other; they register routes and publish through the Bridge. That is
+        what lets the Tuner and the Runner run in one process today and in
+        separate processes later without code changes.
+
+    Threading:
+        Exactly one dispatch thread (``bridge-dispatch``, daemon) runs every
+        handler, in arrival order, so handlers never run concurrently with
+        each other and need no locking among themselves. A slow handler delays
+        all later messages, which is why the Tuner and Runner hand slow work
+        to their own threads. Route and subscription bookkeeping is guarded by
+        a re-entrant lock.
+
+    Backpressure:
+        The dispatch queue is bounded (``queue_size``, default 10,000). When
+        it is full, new messages are dropped (never blocking the broker's
+        network thread) and counted in :attr:`Bridge.dropped`.
+
+===============================================================================
+"""
 import logging
 import queue
 import threading
 from dataclasses import dataclass
-from typing import Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .component import Component
 from .table import BridgeTable
@@ -17,6 +56,16 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class _Attached:
+    """Bookkeeping for a hosted component.
+
+    Attributes:
+        component (Component): The hosted component.
+        routes (list[Route]): The routes registered on its behalf (removed on
+            detach).
+        started (bool): Whether ``component.start`` has been called and not
+            yet matched by ``stop``.
+    """
+
     component: Component
     routes: list[Route]
     started: bool = False
@@ -34,6 +83,16 @@ class Bridge:
 
     A message that matches several routes is delivered to all of them.
     When the queue is full, new messages are dropped and counted in ``dropped``.
+
+    Every connector subscribes to every route's topic; published messages go
+    through the first connector unless another is named. The Bridge can be
+    restarted after :meth:`close`, and is usable as a context manager
+    (``with bridge:`` calls :meth:`start` and :meth:`close`).
+
+    Attributes:
+        started (bool): Whether the Bridge is running (read-only).
+        dropped (int): Messages dropped since the last start (read-only).
+        routes (list[Route]): Snapshot of the registered routes (read-only).
     """
 
     def __init__(
@@ -44,6 +103,23 @@ class Bridge:
         db_path: str = "bridge.db",
         queue_size: int = 10_000,
     ) -> None:
+        """Configure the Bridge; nothing connects until :meth:`start`.
+
+        Args:
+            connectors: Connectors by identifier, or a sequence (identifiers
+                become ``connector-0``, ``connector-1``...). The first one is
+                the default for publishing.
+            routes: Routes to register immediately.
+            components: Components to attach immediately (their routes are
+                registered; they are started with the Bridge).
+            db_path: SQLite file for the routing table.
+            queue_size: Capacity of the dispatch queue.
+
+        Raises:
+            ValueError: If no connector is given.
+            RuntimeError: If the same component appears twice in
+                ``components``.
+        """
         if isinstance(connectors, Mapping):
             self._connectors = dict(connectors)
         else:
@@ -71,8 +147,21 @@ class Bridge:
 
     @classmethod
     def from_config(
-        cls, config: BrokerConfig | Sequence[BrokerConfig], **kwargs
+        cls, config: BrokerConfig | Sequence[BrokerConfig], **kwargs: Any
     ) -> "Bridge":
+        """Build a Bridge whose connectors are created from broker configurations.
+
+        Args:
+            config: One configuration, or a list/tuple of them.
+            **kwargs: Passed to the constructor (``components``, ``db_path``...).
+
+        Returns:
+            A new, not yet started Bridge.
+
+        Raises:
+            NotImplementedError: For broker types without a connector.
+            TypeError: For unknown configuration types.
+        """
         configs = list(config) if isinstance(config, (list, tuple)) else [config]
         return cls([create_connector(c) for c in configs], **kwargs)
 
@@ -80,6 +169,7 @@ class Bridge:
 
     @property
     def started(self) -> bool:
+        """Whether :meth:`start` has completed and :meth:`close` has not been called since."""
         return self._started
 
     @property
@@ -89,20 +179,31 @@ class Bridge:
 
     @property
     def routes(self) -> list[Route]:
+        """A copy of the registered routes, in registration order."""
         with self._lock:
             return list(self._routes)
 
-    def status(self) -> list[dict]:
+    def status(self) -> list[dict[str, Any]]:
         """Connector rows from the bridge table (empty when the bridge is closed)."""
         return self._table.connectors()
 
-    def routing_table(self) -> list[dict]:
+    def routing_table(self) -> list[dict[str, Any]]:
         """Route rows from the bridge table (empty when the bridge is closed)."""
         return self._table.routes()
 
     # --------------------------------------------------------------- routing
 
     def add_route(self, route: Route) -> Route:
+        """Register a route; subscribe at once if the Bridge is running.
+
+        Adding the same route object twice has no effect.
+
+        Args:
+            route: The route to add.
+
+        Returns:
+            ``route``, for chaining.
+        """
         with self._lock:
             if route in self._routes:
                 return route
@@ -113,7 +214,17 @@ class Bridge:
         return route
 
     def drop_route(self, route: Route) -> bool:
-        """Remove a route. The broker subscription is dropped with the last route using it."""
+        """Remove a route. The broker subscription is dropped with the last route using it.
+
+        If other routes still use the same topic filter, the subscription is
+        kept but re-sent when the highest requested QoS changes.
+
+        Args:
+            route: The route to remove (compared by identity).
+
+        Returns:
+            ``True`` if the route was registered and has been removed.
+        """
         with self._lock:
             if route not in self._routes:
                 return False
@@ -129,6 +240,7 @@ class Bridge:
         return True
 
     def _qos_for(self, topic: str) -> int | None:
+        """Highest explicit QoS among the routes on ``topic``, or ``None`` if none set one."""
         explicit = [r.qos for r in self._routes if r.topic == topic and r.qos is not None]
         return max(explicit) if explicit else None
 
@@ -144,7 +256,17 @@ class Bridge:
     # ------------------------------------------------------------ components
 
     def attach(self, component: Component) -> "Bridge":
-        """Host a component (a Tuner, a Runner...): register its routes and, once running, start it."""
+        """Host a component (a Tuner, a Runner...): register its routes and, once running, start it.
+
+        Args:
+            component: The component to host.
+
+        Returns:
+            The Bridge, for chaining.
+
+        Raises:
+            RuntimeError: If the component is already attached.
+        """
         if any(a.component is component for a in self._attached):
             raise RuntimeError("This component is already attached.")
         attached = _Attached(component, [self.add_route(r) for r in component.routes()])
@@ -155,6 +277,13 @@ class Bridge:
         return self
 
     def detach(self, component: Component) -> None:
+        """Remove a component: drop its routes and stop it if it was started.
+
+        Detaching a component that is not attached does nothing.
+
+        Args:
+            component: The component to remove.
+        """
         attached = next((a for a in self._attached if a.component is component), None)
         if attached is None:
             return
@@ -167,6 +296,16 @@ class Bridge:
     # ------------------------------------------------------------- messaging
 
     def publish(self, message: Message, connector_id: str | None = None) -> None:
+        """Publish a message through one connector.
+
+        Args:
+            message: The message to send.
+            connector_id: Connector to use; ``None`` means the first one.
+
+        Raises:
+            RuntimeError: If the Bridge is not running.
+            KeyError: If ``connector_id`` is unknown.
+        """
         if not self._started:
             raise RuntimeError("Bridge is not running.")
         if connector_id is None:
@@ -190,6 +329,11 @@ class Bridge:
             log.warning("Dispatch queue full; dropping message on %s", message.topic)
 
     def _run(self) -> None:
+        """Dispatch loop: take messages off the queue until the stop event is set.
+
+        The 0.2 s ``get`` timeout bounds how long :meth:`close` waits for the
+        loop to notice the stop event when the queue is idle.
+        """
         q = self._queue
         while not self._stop.is_set():
             try:
@@ -199,6 +343,11 @@ class Bridge:
             self._dispatch(message)
 
     def _dispatch(self, message: Message) -> None:
+        """Call every matching route's handler; log and continue if one raises.
+
+        The matching routes are snapshotted under the lock, but handlers are
+        called outside it so that a handler may add or drop routes.
+        """
         with self._lock:
             routes = [r for r in self._routes if r.matches(message.topic)]
         if not routes:
@@ -213,6 +362,23 @@ class Bridge:
     # ------------------------------------------------------------- lifecycle
 
     def start(self) -> "Bridge":
+        """Connect, subscribe, and start the hosted components.
+
+        Order: open the table, start the dispatch thread, connect each
+        connector (recording ``registered`` / ``running`` / ``error`` in the
+        table), subscribe to every route topic, mark the Bridge started, then
+        start components in attach order. Components therefore find the
+        Bridge ready to publish when ``start`` is called on them.
+
+        Returns:
+            The Bridge, for chaining.
+
+        Raises:
+            RuntimeError: If the Bridge is already running.
+            Exception: Whatever a connector's ``connect`` or a component's
+                ``start`` raises (for example ``OSError``). The Bridge is
+                closed before the exception propagates.
+        """
         if self._started:
             raise RuntimeError("Bridge is already running.")
 
@@ -251,7 +417,15 @@ class Bridge:
         return self
 
     def close(self) -> None:
-        """Stop everything. Safe to call more than once, and after a failed start."""
+        """Stop everything. Safe to call more than once, and after a failed start.
+
+        Order: signal the dispatch thread, disconnect connectors, wait up to
+        5 s for the dispatch thread (it may be inside a slow handler), stop
+        started components in reverse attach order, then close the table.
+        Errors from connectors and components are logged, not raised. When
+        called from a handler (on the dispatch thread) it does not join
+        itself.
+        """
         self._stop.set()
 
         for connector_id, connector in self._connectors.items():
@@ -283,8 +457,10 @@ class Bridge:
         self._thread = None
 
     def __enter__(self) -> "Bridge":
+        """Start the Bridge and return it."""
         return self.start()
 
-    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+    def __exit__(self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: Any) -> bool:
+        """Close the Bridge; exceptions from the ``with`` body propagate."""
         self.close()
         return False

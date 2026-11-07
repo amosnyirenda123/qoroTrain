@@ -1,3 +1,23 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_bridge.py
+
+Description:
+    Unit tests of :class:`~qorotrain.bridges.bridge.Bridge` and
+    :class:`~qorotrain.bridges.table.BridgeTable` with fake connectors: routing
+    and wildcard matching, dispatch on a single thread in arrival order, handler
+    isolation, queue overflow accounting, start/close/restart lifecycle,
+    subscription bookkeeping (QoS upgrades, unsubscribe with the last route),
+    publishing, the SQLite mirror, component attach/detach and ``from_config``.
+
+    Note: ``test_cli.py`` currently contains a newer copy of these tests with
+    extra component-lifecycle cases.
+
+===============================================================================
+"""
 import threading
 
 import pytest

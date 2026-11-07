@@ -1,3 +1,21 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/nbhelpers.py
+
+Description:
+    Builders for throw-away notebooks and ``experiment.yaml`` texts used by the
+    configuration tests.
+
+    ``write_notebook`` creates an ``.ipynb`` from ``(source, tags)`` pairs;
+    ``good_notebook`` writes a notebook with a clean ``parameters`` cell
+    (``PARAMS``) and a training cell that logs metrics (``TRAINING``);
+    ``experiment_yaml`` renders a consistent experiment for that notebook.
+
+===============================================================================
+"""
 from pathlib import Path
 
 import nbformat

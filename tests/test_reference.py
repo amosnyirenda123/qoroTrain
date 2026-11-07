@@ -1,4 +1,16 @@
-"""The YAML reference must describe every key of the schema, and only keys that exist."""
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_reference.py
+
+Description:
+    The YAML reference must describe every key of the schema, and only keys that
+    exist.
+
+===============================================================================
+"""
 import re
 from pathlib import Path
 

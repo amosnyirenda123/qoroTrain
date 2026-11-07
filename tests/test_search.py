@@ -1,3 +1,20 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_search.py
+
+Description:
+    Tests of scoring, search spaces and storage:
+    :func:`~qorotrain.tuners.objective.aggregate` and ``is_better``,
+    :class:`~qorotrain.tuners.space.SearchSpace` validation, sampling (ranges,
+    log-uniformity, reproducibility) and grid construction, and
+    :class:`~qorotrain.store.metric_store.MetricStore` lifecycle, deduplication,
+    NaN handling, concurrency and persistence.
+
+===============================================================================
+"""
 import math
 import random
 import threading

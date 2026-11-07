@@ -1,6 +1,18 @@
-"""`qorotrainctl run` end to end: real Mosquitto, real Papermill and kernels, the real CLI.
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_e2e.py
 
-Skipped unless a broker is on localhost:1883 and papermill plus a ``python3`` kernel are installed.
+Description:
+    `qorotrainctl run` end to end: real Mosquitto, real Papermill and kernels,
+    the real CLI.
+
+    Skipped unless a broker is on localhost:1883 and papermill plus a
+    ``python3`` kernel are installed.
+
+===============================================================================
 """
 import os
 import signal

@@ -1,3 +1,16 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_routes.py
+
+Description:
+    Tests of :mod:`qorotrain.routes.route`: MQTT wildcard matching, rejection of
+    malformed filters and QoS values, and identity semantics of routes.
+
+===============================================================================
+"""
 import pytest
 
 from qorotrain.routes.route import Route, topic_matches

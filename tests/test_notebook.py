@@ -1,3 +1,18 @@
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_notebook.py
+
+Description:
+    Tests of :mod:`qorotrain.config.notebook`: literal extraction from the
+    ``parameters`` cell, problems reported with line numbers for derived values,
+    calls and other statements, IPython magics, syntax errors, tagged-cell
+    discovery and file errors.
+
+===============================================================================
+"""
 import pytest
 
 from nbhelpers import good_notebook, write_notebook

@@ -1,4 +1,16 @@
-"""The files in examples/ are documentation that runs: they must keep validating."""
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_examples.py
+
+Description:
+    The files in examples/ are documentation that runs: they must keep
+    validating.
+
+===============================================================================
+"""
 from pathlib import Path
 
 import pytest

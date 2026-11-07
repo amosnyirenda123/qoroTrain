@@ -1,7 +1,17 @@
-"""Integration tests against a real broker (Mosquitto on localhost:1883).
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: tests/test_mqtt_integration.py
 
-Start one with ``docker compose up -d`` and run ``pytest -m broker``.
-The tests are skipped automatically when no broker is reachable.
+Description:
+    Integration tests against a real broker (Mosquitto on localhost:1883).
+
+    Start one with ``docker compose up -d`` and run ``pytest -m broker``. The
+    tests are skipped automatically when no broker is reachable.
+
+===============================================================================
 """
 import queue
 import socket

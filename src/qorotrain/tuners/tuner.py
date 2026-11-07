@@ -1,13 +1,46 @@
-"""The Tuner owns the loop; a subclass only decides what to try next.
+"""
+===============================================================================
+Author: Amos Nyirenda
+Date: 2026-11-07
+Last Updated: 2026-11-07
+File: qorotrain/tuners/tuner.py
 
-    run ends (status event) --> settle --> score --> stop rules --> propose --> review --> start next run
+Description:
+    The Tuner owns the loop; a subclass only decides what to try next.
 
-Threading. Handlers run on the bridge's single dispatch thread, so they only record data
-(statuses and metrics go to the store). Everything slow happens on the tuner's own decision
-thread: waiting for stragglers, scoring, ``propose`` (an LLM call, later), and the review
-(which may wait for a person). Metrics keep flowing while the tuner thinks.
+    .. code-block:: text
 
-Call :meth:`begin` once the bridge is up (and the runner is subscribed) to launch the first run.
+        run ends (status event) --> settle --> score --> stop rules --> propose --> review --> start next run
+
+    Threading. Handlers run on the bridge's single dispatch thread, so they only record data
+    (statuses and metrics go to the store). Everything slow happens on the tuner's own decision
+    thread: waiting for stragglers, scoring, ``propose`` (an LLM call, later), and the review
+    (which may wait for a person). Metrics keep flowing while the tuner thinks.
+
+    Call :meth:`Tuner.begin` once the bridge is up (and the runner is subscribed) to launch the first run.
+
+    Design:
+        Template Method pattern. :class:`Tuner` implements messaging,
+        persistence, scoring, stop rules, proposal completion and review;
+        subclasses implement only :meth:`Tuner.propose`. That keeps every
+        algorithm on an identical pipeline, so comparisons between algorithms
+        isolate the search strategy.
+
+    Session protocol:
+        Runs are strictly sequential: the Tuner launches one run, waits for
+        its terminal status, then decides the next. Run ids are
+        ``<session>-<NNN>``. Status and metric messages for runs this Tuner
+        did not launch are ignored, so several sessions can share a broker.
+
+    Failure handling:
+        A run that fails or produces no finite objective is recorded as a
+        ``failed`` trial; three consecutive failures end the session. If the
+        Runner never acknowledges a start command, it is re-sent once after
+        ``start_timeout`` seconds, and the session ends after a second
+        timeout. Unexpected exceptions on the decision thread end the session
+        with ``internal error``.
+
+===============================================================================
 """
 import logging
 import queue
@@ -54,6 +87,27 @@ class StopTuning(Exception):
 
 
 class Tuner(ABC):
+    """Abstract tuning session: a Bridge component that runs the propose-run-score loop.
+
+    The Tuner subscribes to the status and metrics topics of every run in its
+    project, records what it receives in the
+    :class:`~qorotrain.store.metric_store.MetricStore`, and publishes start
+    (and, on abort, stop) commands for the Runner.
+
+    Stop rules, checked after each run in this order:
+
+    1. ``max_failures`` consecutive failed runs.
+    2. ``stop.target`` reached by the best objective.
+    3. ``max_runs`` runs completed (baseline included).
+    4. ``stop.patience`` runs since the best one without improvement.
+
+    Attributes:
+        finished (threading.Event): Set when the session is over, for any
+            reason. :meth:`wait` blocks on it.
+        stop_reason (str | None): Human-readable reason the session ended,
+            ``None`` while it is running.
+    """
+
     def __init__(
         self,
         *,
@@ -71,6 +125,27 @@ class Tuner(ABC):
         start_timeout: float = 30.0,
         session: str | None = None,
     ) -> None:
+        """Configure the session. Nothing happens until the Bridge starts it and :meth:`begin` is called.
+
+        Args:
+            space: Search space used to validate every proposal.
+            objective: Metric, aggregation and direction used for scoring.
+            project: Experiment name (topic segment and store ``project``).
+            store: Where runs and metrics are recorded.
+            topic_root: Topic root.
+            max_runs: Run budget, including the baseline run.
+            stop: Optional ``target`` / ``patience`` rules.
+            initial: Baseline parameters for run 0. ``None`` makes run 0 the
+                algorithm's first proposal.
+            reviewer: Reviewer for proposals; defaults to
+                :class:`~qorotrain.tuners.review.AutoApprove`.
+            max_failures: Consecutive failed runs that end the session.
+            settle_seconds: Delay after a terminal status before scoring, so
+                that metric batches still in flight are stored first.
+            start_timeout: Seconds to wait for the Runner's ``started``
+                status before re-sending (once) or giving up.
+            session: Run-id prefix; a random 6-hex-digit value by default.
+        """
         self._space = space
         self._objective = objective
         self._project = project
@@ -108,17 +183,41 @@ class Tuner(ABC):
     @abstractmethod
     def propose(self, history: list[Trial]) -> Proposal:
         """The next configuration to try. May return only the parameters that change; the rest are
-        taken from the previous run. Raise :class:`StopTuning` when there is nothing left to try."""
+        taken from the previous run. Raise :class:`StopTuning` when there is nothing left to try.
+
+        Called on the decision thread, so it may be slow.
+
+        Args:
+            history: Every completed trial, oldest first (empty for the first
+                proposal when there is no baseline).
+
+        Returns:
+            The proposal. It is validated against the search space after
+            completion; an invalid proposal ends the session.
+
+        Raises:
+            StopTuning: When the algorithm is exhausted.
+        """
 
     # ------------------------------------------------------------- component
 
     def routes(self) -> list[Route]:
+        """Subscribe to every run's status and metrics topics in the project, at QoS 1.
+
+        Returns:
+            The status and metrics routes.
+        """
         return [
             Route(status_pattern(self._root, self._project), self.on_status, qos=1),
             Route(metrics_pattern(self._root, self._project), self.on_metrics, qos=1),
         ]
 
     def start(self, bridge: "Bridge") -> None:
+        """Keep the Bridge and start the decision thread (``tuner-decisions``) if it is not running.
+
+        Args:
+            bridge: The running Bridge.
+        """
         self._bridge = bridge
         if self._thread is None or not self._thread.is_alive():
             self._halt.clear()
@@ -126,6 +225,11 @@ class Tuner(ABC):
             self._thread.start()
 
     def stop(self) -> None:
+        """Halt the decision thread (waiting up to 5 s) and forget the Bridge.
+
+        This does not end the session (``finished`` is not set); use
+        :meth:`abort` for that.
+        """
         self._halt.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
@@ -136,7 +240,15 @@ class Tuner(ABC):
     # --------------------------------------------------------------- control
 
     def begin(self) -> None:
-        """Launch the first run: the baseline (``initial``) if there is one, otherwise ``propose([])``."""
+        """Launch the first run: the baseline (``initial``) if there is one, otherwise ``propose([])``.
+
+        The baseline is launched without review; a first proposal is reviewed
+        like any other.
+
+        Raises:
+            RuntimeError: If the tuner is not attached to a running Bridge, or
+                has already begun.
+        """
         if self._bridge is None:
             raise RuntimeError("The tuner is not attached to a running bridge.")
         if self._current is not None or self._history:
@@ -155,11 +267,26 @@ class Tuner(ABC):
         self._launch(params)
 
     def wait(self, timeout: float | None = None) -> bool:
-        """Block until the session is over. True if it finished within ``timeout``."""
+        """Block until the session is over. True if it finished within ``timeout``.
+
+        Args:
+            timeout: Seconds to wait, or ``None`` to wait indefinitely.
+
+        Returns:
+            Whether the session has finished.
+        """
         return self.finished.wait(timeout)
 
     def abort(self, reason: str = "aborted") -> None:
-        """End the session now and ask the runner to stop the active run."""
+        """End the session now and ask the runner to stop the active run.
+
+        The active run is forgotten first, so its terminal status will not be
+        scored. Publishing the stop command is best-effort.
+
+        Args:
+            reason: Recorded as ``stop_reason`` (unless the session had
+                already finished).
+        """
         with self._lock:
             run = self._current
             self._current = None
@@ -172,16 +299,29 @@ class Tuner(ABC):
 
     @property
     def history(self) -> list[Trial]:
+        """A copy of the completed trials, oldest first."""
         with self._lock:
             return list(self._history)
 
     @property
     def best(self) -> Trial | None:
+        """The trial with the best objective (earliest wins ties), or ``None`` if none scored."""
         return self._best(self.history)
 
     # -------------------------------------------------------------- handlers
 
     def on_status(self, message: Message) -> None:
+        """Route handler for run statuses (dispatch thread).
+
+        ``started`` for the current run marks it started (in memory and in the
+        store). A terminal status for the current run is queued for the
+        decision thread exactly once: the current run is cleared at the same
+        time, so duplicate deliveries are ignored. Statuses of unknown runs
+        and malformed payloads are ignored (the latter with an error log).
+
+        Args:
+            message: The received status message.
+        """
         try:
             status = decode_status(message.payload)
         except SchemaError as exc:
@@ -204,6 +344,14 @@ class Tuner(ABC):
         self._ended.put((status, params))
 
     def on_metrics(self, message: Message) -> None:
+        """Route handler for metric batches (dispatch thread): store batches of known runs.
+
+        Redelivered batches are harmless because the store ignores duplicate
+        ``(run, metric, step)`` rows.
+
+        Args:
+            message: The received metrics message.
+        """
         try:
             batch = decode_metrics(message.payload)
         except SchemaError as exc:
@@ -217,6 +365,11 @@ class Tuner(ABC):
     # ------------------------------------------------------- decision thread
 
     def _loop(self) -> None:
+        """Decision thread body: handle ended runs until halted or finished.
+
+        Polls the queue every 0.2 s so that the start watchdog runs while
+        idle.
+        """
         while not self._halt.is_set() and not self.finished.is_set():
             try:
                 status, params = self._ended.get(timeout=0.2)
@@ -249,7 +402,13 @@ class Tuner(ABC):
         else:
             self._finish(f"the runner did not answer for run {run} (is it running and subscribed?)")
 
-    def _on_run_ended(self, status: Status, params: dict) -> None:
+    def _on_run_ended(self, status: Status, params: dict[str, Any]) -> None:
+        """Score the ended run, record it, apply the stop rules, and launch the next proposal.
+
+        Args:
+            status: The run's terminal status.
+            params: The parameters the run was launched with.
+        """
         if self._halt.wait(self._settle):  # let late metric batches arrive before scoring
             return
 
@@ -278,7 +437,21 @@ class Tuner(ABC):
         if params is not None:
             self._launch(params)
 
-    def _score(self, status: Status, params: dict) -> Trial:
+    def _score(self, status: Status, params: dict[str, Any]) -> Trial:
+        """Turn a terminal status and the stored metric series into a :class:`Trial`.
+
+        Only ``finished`` runs are scored. A finished run without a finite
+        objective becomes ``failed`` with an explanatory error; a stopped run
+        stays ``stopped``.
+
+        Args:
+            status: The run's terminal status.
+            params: The run's parameters.
+
+        Returns:
+            The trial, with ``summary`` holding ``points``, ``last`` and
+            ``error`` as applicable.
+        """
         run, metric = status.run, self._objective.metric
         series = [value for _, value in self._store.series(run, metric)]
         summary: dict[str, Any] = {"points": len(series)}
@@ -301,6 +474,14 @@ class Tuner(ABC):
         return Trial(params=params, objective=objective, summary=summary, status=state, run=run)
 
     def _stop_reason(self, history: list[Trial]) -> str | None:
+        """Apply the stop rules (see the class docstring) to the history.
+
+        Args:
+            history: Completed trials, oldest first.
+
+        Returns:
+            Why the session should stop, or ``None`` to continue.
+        """
         failures = 0
         for trial in reversed(history):
             if trial.status != "failed":
@@ -327,6 +508,7 @@ class Tuner(ABC):
         return None
 
     def _best(self, history: list[Trial]) -> Trial | None:
+        """Best-scoring trial of ``history`` (strict improvement, so the earliest wins ties)."""
         best = None
         for trial in history:
             if trial.objective is not None and (
@@ -335,12 +517,24 @@ class Tuner(ABC):
                 best = trial
         return best
 
-    def _complete(self, params: dict, history: list[Trial]) -> dict:
+    def _complete(self, params: dict[str, Any], history: list[Trial]) -> dict[str, Any]:
         """A proposal may name only what changes: the rest comes from the previous run."""
         base = history[-1].params if history else (self._initial or {})
         return {**base, **params}
 
-    def _review(self, params: dict, proposal: Proposal, history: list[Trial]) -> dict | None:
+    def _review(self, params: dict[str, Any], proposal: Proposal, history: list[Trial]) -> dict[str, Any] | None:
+        """Validate a complete proposal, ask the reviewer, and validate any edit.
+
+        Any validation failure or rejection ends the session.
+
+        Args:
+            params: The complete parameters to run.
+            proposal: The original proposal (for its rationale).
+            history: Completed trials.
+
+        Returns:
+            The parameters to launch, or ``None`` if the session ended.
+        """
         problems = self._space.validate(params)
         if problems:
             self._finish("invalid proposal: " + "; ".join(problems))
@@ -360,7 +554,8 @@ class Tuner(ABC):
 
     # ------------------------------------------------------------- launching
 
-    def _launch(self, params: dict) -> None:
+    def _launch(self, params: dict[str, Any]) -> None:
+        """Allocate a run id, record the run in the store, and publish its start command."""
         with self._lock:
             run = f"{self._session}-{self._counter:03d}"
             self._counter += 1
@@ -373,7 +568,8 @@ class Tuner(ABC):
         log.info("run %s: starting", run)
         self._publish_start(run, params)
 
-    def _publish_start(self, run: str, params: dict) -> None:
+    def _publish_start(self, run: str, params: dict[str, Any]) -> None:
+        """Publish a start command at QoS 1; end the session if publishing fails."""
         try:
             self._bridge.publish(
                 Message(start_topic(self._root, self._project), encode(StartCommand(run, params)), qos=1)
@@ -383,6 +579,7 @@ class Tuner(ABC):
             self._finish(f"could not publish the start command ({exc})")
 
     def _finish(self, reason: str) -> None:
+        """End the session once: record ``reason`` and set :attr:`finished` (later calls are ignored)."""
         with self._lock:
             if self.finished.is_set():
                 return
@@ -401,11 +598,26 @@ class RandomTuner(Tuner):
     was already tried (it gives up on that after a few attempts, which only matters for tiny spaces).
     """
 
-    def __init__(self, *, seed: int = 0, **kwargs) -> None:
+    def __init__(self, *, seed: int = 0, **kwargs: Any) -> None:
+        """Create the tuner and its private random generator.
+
+        Args:
+            seed: Seed of the generator.
+            **kwargs: Passed to :class:`Tuner`.
+        """
         super().__init__(**kwargs)
         self._rng = random.Random(seed)
 
     def propose(self, history: list[Trial]) -> Proposal:
+        """Sample a configuration, re-drawing up to 20 times to avoid one already tried.
+
+        Args:
+            history: Completed trials.
+
+        Returns:
+            A complete random configuration (possibly a repeat in very small
+            spaces).
+        """
         tried = [trial.params for trial in history]
         params = self._space.sample(self._rng)
         for _ in range(20):
@@ -424,7 +636,18 @@ class GridTuner(Tuner):
     only varying the last parameter. When the grid is used up the session ends.
     """
 
-    def __init__(self, *, points: int = 3, seed: int = 0, **kwargs) -> None:
+    def __init__(self, *, points: int = 3, seed: int = 0, **kwargs: Any) -> None:
+        """Build and shuffle the grid.
+
+        Args:
+            points: Values per numeric range (at least 2).
+            seed: Seed of the shuffle.
+            **kwargs: Passed to :class:`Tuner`.
+
+        Raises:
+            ValueError: If ``points < 2`` or the grid exceeds
+                :data:`~qorotrain.tuners.space.MAX_GRID_SIZE` cells.
+        """
         super().__init__(**kwargs)
         self._cells = self._space.grid(points)
         random.Random(seed).shuffle(self._cells)
@@ -432,9 +655,21 @@ class GridTuner(Tuner):
 
     @property
     def grid_size(self) -> int:
+        """Total number of grid cells."""
         return len(self._cells)
 
     def propose(self, history: list[Trial]) -> Proposal:
+        """Return the next grid cell not already tried.
+
+        Args:
+            history: Completed trials.
+
+        Returns:
+            The next cell, with ``grid cell i of n`` as rationale.
+
+        Raises:
+            StopTuning: When every cell has been proposed.
+        """
         tried = [trial.params for trial in history]
         while self._next < len(self._cells):
             cell = self._cells[self._next]
@@ -445,10 +680,24 @@ class GridTuner(Tuner):
 
 
 class AgenticTuner(Tuner):
+    """Placeholder for the LLM agent algorithm (not implemented)."""
+
     def propose(self, history: list[Trial]) -> Proposal:
+        """Not implemented yet.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("the LLM agent is not implemented yet")
 
 
 class OptunaTuner(Tuner):
+    """Placeholder for an Optuna (TPE) baseline (not implemented)."""
+
     def propose(self, history: list[Trial]) -> Proposal:
+        """Not implemented yet.
+
+        Raises:
+            NotImplementedError: Always.
+        """
         raise NotImplementedError("the Optuna tuner is not implemented yet")
