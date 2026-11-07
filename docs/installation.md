@@ -33,6 +33,10 @@ This installs two console scripts:
 | `qorotrainctl` | `qorotrain.cli.main:main` | The command line (`init`, `validate`, `run`). |
 | `qorotrain` | `qorotrain:main` | Placeholder that prints a greeting. |
 
+`python -m qorotrain <args>` runs the same command line as `qorotrainctl <args>`
+(same arguments, output and exit codes). Use it when the console script is not
+on `PATH`, or to pick the interpreter explicitly: `.venv/bin/python -m qorotrain`.
+
 ## Make the notebook kernel see Qorotrain
 
 The notebook runs in a Jupyter kernel, which may be a different Python

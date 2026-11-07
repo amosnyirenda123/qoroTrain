@@ -11,6 +11,7 @@ by module in the [API reference](reference/index.md).
 | Module | Responsibility | Key names |
 |---|---|---|
 | `qorotrain` | Package root. Re-exports only what a notebook needs. | `Tracker`, `main` (placeholder script) |
+| `qorotrain.__main__` | `python -m qorotrain` runs the CLI (delegates to `cli.main.main`). Safe to import. | (none) |
 | `qorotrain.main` | `python -m qorotrain.main` runs the CLI. **Exits at import**, so it is not in the API reference. | (none) |
 | **Configuration** | | |
 | `config` | Facade over the configuration modules. | `load_experiment`, `validate_experiment`, `generate_experiment`, `ConfigError` |
