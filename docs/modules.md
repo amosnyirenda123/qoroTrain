@@ -131,9 +131,9 @@ Things to notice:
 |---|---|---|
 | `paho-mqtt` 2.x | `connectors.connector` | MQTT v5 client (`CallbackAPIVersion.VERSION2`). |
 | `pydantic` 2.x | `config.models`, `config.loader`, `config.reference` | Schema validation and introspection. |
-| `pyyaml` | `config.loader`, `config.init`, `runners.runner` | YAML parsing and writing `params.yaml`. *Not declared in `pyproject.toml`; installed transitively.* |
+| `pyyaml` | `config.loader`, `config.init`, `runners.runner` | YAML parsing and writing `params.yaml`. |
 | `nbformat` | `config.notebook` | Reading `.ipynb` files. |
-| `papermill` | `runners.runner` (as a subprocess) | Parameter injection and notebook execution. *Not declared.* |
+| `papermill` | `runners.runner` (as a subprocess) | Parameter injection and notebook execution. |
 | `sqlite3` (standard library) | `store.metric_store`, `bridges.table` | Persistence. |
 
 `langchain`, `langchain-chroma`, `langchain-google-genai`, `langchain-openai`,

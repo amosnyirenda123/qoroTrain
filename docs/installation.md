@@ -7,15 +7,8 @@
 | Python **3.12 or newer** (`requires-python = ">=3.12"`; the repository pins 3.14 in `.python-version`) | The code uses `match` statements and PEP 604 unions throughout. |
 | A POSIX operating system (Linux, macOS) | The Runner gives each run its own process group (`start_new_session`, `os.killpg`) so that stopping a run also stops its children. |
 | An MQTT broker, for example Eclipse Mosquitto 2 | All components communicate through it. |
-| [Papermill](https://papermill.readthedocs.io) and a Jupyter kernel | The Runner executes the notebook with `python -m papermill`. |
+| A Jupyter kernel (for example from `ipykernel`) | The Runner executes the notebook with `python -m papermill` (installed with Qorotrain) in the kernel named by `runner.kernel`. |
 | [uv](https://docs.astral.sh/uv/) (recommended) | The project is managed with uv (`uv.lock`, `uv_build` backend). |
-
-```{warning}
-`papermill` and `pyyaml` are imported or invoked by the code but are **not
-declared** in `pyproject.toml`. PyYAML is usually installed transitively;
-Papermill is not. Install Papermill yourself (see below) or `qorotrainctl run`
-reports every run as failed with `No module named papermill`.
-```
 
 ## Install the package
 
@@ -23,14 +16,14 @@ From the repository root:
 
 ```bash
 uv sync                      # creates .venv with the runtime and dev dependencies
-uv pip install papermill ipykernel
+uv pip install ipykernel     # a Jupyter kernel for the notebook (see below)
 ```
 
 Or, without uv:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e . papermill ipykernel
+pip install -e . ipykernel
 ```
 
 This installs two console scripts:

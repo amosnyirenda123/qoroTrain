@@ -15,10 +15,12 @@ dependencies = [
     "langgraph>=1.2.18",
     "nbformat>=5.11.1",
     "paho-mqtt>=2.1.0",
+    "papermill>=2.7.0",
     "pgvector>=0.5.1",
     "pydantic>=2.14.1",
     "pydantic-settings>=2.16.1",
     "pytest>=9.2.0",
+    "pyyaml>=6.0.3",
 ]
 
 [project.scripts]
