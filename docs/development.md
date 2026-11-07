@@ -188,6 +188,20 @@ importing it runs the CLI.
 These were found while documenting the code (2026-11-07). The documentation
 describes the code as it is and points here where behaviour is incomplete.
 
+### Defects
+
+- **Stopping a run during kernel start-up can orphan the Jupyter kernel.**
+  The Runner stops a run by signalling Papermill's process group, but
+  `jupyter_client` starts every kernel in its own session, so the kernel is not
+  in that group. Papermill dies on SIGTERM without shutting the kernel down.
+  ipykernel normally notices its parent's death (`JPY_PARENT_PID`), but if the
+  parent is already gone when the kernel's watcher starts, it falls back to
+  waiting for `ppid == 1`. On systemd desktops orphans are adopted by
+  `systemd --user` instead, so the idle kernel keeps running. A stop one second
+  or more after the kernel appears is cleaned up correctly.
+  `test_e2e.py::test_ctrl_c_stops_the_session_and_the_active_run` interrupts at
+  exactly that moment and fails with "a kernel was left running".
+
 ### Packaging
 
 - `pytest` is listed under runtime `dependencies` as well as in the `dev`
