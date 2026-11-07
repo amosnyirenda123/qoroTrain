@@ -8,13 +8,12 @@ File: tests/test_bridge.py
 Description:
     Unit tests of :class:`~qorotrain.bridges.bridge.Bridge` and
     :class:`~qorotrain.bridges.table.BridgeTable` with fake connectors: routing
-    and wildcard matching, dispatch on a single thread in arrival order, handler
-    isolation, queue overflow accounting, start/close/restart lifecycle,
-    subscription bookkeeping (QoS upgrades, unsubscribe with the last route),
-    publishing, the SQLite mirror, component attach/detach and ``from_config``.
-
-    Note: ``test_cli.py`` currently contains a newer copy of these tests with
-    extra component-lifecycle cases.
+    and wildcard matching, dispatch on a single thread in arrival order,
+    handler isolation, queue overflow accounting, start/close/restart
+    lifecycle, subscription bookkeeping (QoS upgrades, unsubscribe with the
+    last route), publishing, the SQLite mirror, ``from_config``, and the
+    component lifecycle (attach/detach, several components, start order and
+    reverse stop order, attach while running, failing component start).
 
 ===============================================================================
 """
@@ -29,7 +28,6 @@ from qorotrain.connectors.config import MQTTConfig, RabbitMQConfig
 from qorotrain.connectors.connector import MQTTConnector
 from qorotrain.messages.message import Message
 from qorotrain.routes.route import Route
-from qorotrain.tuners.tuner import Proposal, Tuner
 
 
 def make_bridge(*connectors, routes=None, **kwargs):
@@ -243,24 +241,21 @@ def test_stale_connector_rows_are_reset_on_start(tmp_path):
 # --------------------------------------------------------------------- tuner
 
 
-class DummyTuner(Tuner):
+class DummyTuner:
+    """Any object with routes/start/stop is a component."""
+
     def __init__(self):
-        super().__init__()
         self.received, self.stopped, self.bridge_seen = [], False, None
 
     def start(self, bridge):
-        super().start(bridge)
         self.bridge_seen = bridge
 
     def stop(self):
-        super().stop()
         self.stopped = True
 
     def routes(self):
         return [Route("tuning/+/+/status", self.received.append)]
 
-    def propose(self, history):
-        return Proposal(params={})
 
 
 def test_attached_tuner_gets_routes_start_and_stop():
@@ -273,13 +268,69 @@ def test_attached_tuner_gets_routes_start_and_stop():
     assert tuner.stopped
 
 
-def test_second_attach_raises_and_detach_removes_routes():
+def test_attaching_the_same_component_twice_raises():
+    tuner = DummyTuner()
+    bridge = make_bridge(FakeConnector()).attach(tuner)
+    with pytest.raises(RuntimeError, match="already attached"):
+        bridge.attach(tuner)
+
+
+def test_several_components_share_one_bridge_and_detach_independently():
+    c, a, b = FakeConnector(), DummyTuner(), DummyTuner()
+    b.routes = lambda: [Route("other/topic", b.received.append)]  # a different topic
+    bridge = make_bridge(c).attach(a).attach(b)
+    with bridge:
+        c.deliver("tuning/p/r/status")
+        c.deliver("other/topic")
+        assert wait_for(lambda: len(a.received) == 1 and len(b.received) == 1)
+
+        bridge.detach(b)
+        assert b.stopped and not a.stopped
+        assert [r.topic for r in bridge.routes] == ["tuning/+/+/status"]
+        assert c.unsubscribed == ["other/topic"]
+
+
+def test_components_start_in_order_and_stop_in_reverse():
+    events = []
+
+    class Recorder(DummyTuner):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+
+        def start(self, bridge):
+            events.append(f"start {self.name}")
+
+        def stop(self):
+            events.append(f"stop {self.name}")
+
+        def routes(self):
+            return []
+
+    bridge = make_bridge(FakeConnector()).attach(Recorder("a")).attach(Recorder("b"))
+    with bridge:
+        pass
+    assert events == ["start a", "start b", "stop b", "stop a"]
+
+
+def test_a_component_attached_while_running_is_started_at_once():
     c, tuner = FakeConnector(), DummyTuner()
-    bridge = make_bridge(c).attach(tuner)
-    with pytest.raises(RuntimeError):
-        bridge.attach(DummyTuner())
-    bridge.detach()
-    assert bridge.routes == []
+    with make_bridge(c) as bridge:
+        bridge.attach(tuner)
+        assert tuner.bridge_seen is bridge
+        assert ("tuning/+/+/status", None) in c.subscribed
+
+
+def test_a_failing_component_start_closes_the_bridge():
+    class Broken(DummyTuner):
+        def start(self, bridge):
+            raise RuntimeError("cannot start")
+
+    c = FakeConnector()
+    bridge = make_bridge(c).attach(Broken())
+    with pytest.raises(RuntimeError, match="cannot start"):
+        bridge.start()
+    assert not bridge.started and not c.connected
 
 
 # --------------------------------------------------------------- from_config

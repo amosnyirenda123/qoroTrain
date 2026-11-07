@@ -193,14 +193,19 @@ describes the code as it is and points here where behaviour is incomplete.
 - **`validate` and `run` crash on any readable notebook.**
   `config.validate._check_notebook` reads `notebook.language`, but
   `config.notebook.NotebookInfo` has no such attribute (it should come from the
-  notebook's `kernelspec` or `language_info` metadata). This causes 33 test
-  failures in `test_validate_init.py`, `test_init.py` and `test_examples.py`.
-- **`tests/test_examples.py` looks for `examples/` at the repository root.**
-  The example lives at `src/qorotrain/examples/bandits.yaml`, and the
-  `bandits.ipynb` notebook it refers to is not in the repository.
-- **Two Bridge tests construct a `Tuner` subclass without arguments**
-  (`DummyTuner` in `test_bridge.py` and `test_cli.py`). `Tuner.__init__` now
-  requires `space`, `objective`, `project` and `store`.
+  notebook's `kernelspec` or `language_info` metadata). This causes 17 test
+  failures in `test_validate_init.py`.
+- **A test is ahead of its helper.**
+  `test_validate_init.py::test_notebook_without_kernel_metadata_is_an_error`
+  calls `nbhelpers.write_notebook(..., metadata=...)`, but the helper has no
+  `metadata` parameter (`TypeError`).
+- **The example tests have no usable example.** `tests/test_examples.py`
+  expects `examples/bandits.yaml` and an instrumented `examples/bandits.ipynb`
+  (a `parameters` cell with `eps`, `n_plays`, `n_arms`, `n_repeats`, `seed`,
+  and a Tracker logging `avg_reward`). The YAML lives at
+  `src/qorotrain/examples/bandits.yaml`. The committed `examples/bandits.ipynb`
+  is the original, uninstrumented study notebook, and no instrumented version
+  exists in the repository or its history.
 
 ### Packaging
 
@@ -214,10 +219,8 @@ describes the code as it is and points here where behaviour is incomplete.
 
 ### Test suite
 
-- `test_cli.py` tests the Bridge, not the CLI. It is a newer copy of
-  `test_bridge.py`. No test drives `cli.main` in-process except through the
+- No test drives `cli.main` in-process. The CLI is exercised only by the
   broker-gated `test_e2e.py`.
-- `test_init.py` is an older subset of `test_validate_init.py`.
 - The `broker` pytest marker is not registered.
 
 ### Not implemented (accepted by the schema)
