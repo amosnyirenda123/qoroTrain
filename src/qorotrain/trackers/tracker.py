@@ -90,7 +90,9 @@ class Tracker:
                 connector = MQTTConnector(
                     MQTTConfig(host=host, port=port, qos=1, username=username, password=password)
                 )
-            connector.connect()
+                connector.connect(timeout=connect_timeout)
+            else:
+                connector.connect()  # an injected connector (tests) decides its own timeout
         except Exception as exc:
             self._warn_once("connect", f"qorotrain: cannot connect to the broker, telemetry is disabled ({exc})")
             return

@@ -102,6 +102,7 @@ class Runner:
 
         self._bridge: "Bridge | None" = None
         self._active: _Run | None = None
+        self._seen: set[str] = set()  # run ids already handled: MQTT may deliver a command twice
         self._lock = threading.Lock()
 
     @classmethod
@@ -167,6 +168,10 @@ class Runner:
 
         run, error = None, None
         with self._lock:
+            if command.run in self._seen:
+                log.info("duplicate start command for run %s ignored", command.run)
+                return
+            self._seen.add(command.run)
             if self._active is not None:
                 error = f"runner is busy with run {self._active.id}"
             else:

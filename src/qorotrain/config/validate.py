@@ -36,6 +36,7 @@ def validate_experiment(
     report = ValidationReport()
 
     _check_objective_placeholder(spec, report)
+    _check_algorithm(spec, report)
     _check_notebook(spec, resolve_source(spec, base_dir), report)
     if check_broker:
         _check_brokers(spec, broker_timeout, report)
@@ -49,12 +50,29 @@ def _check_objective_placeholder(spec: ExperimentSpec, report: ValidationReport)
         )
 
 
+AVAILABLE_ALGORITHMS = ("random", "grid")
+
+
+def _check_algorithm(spec: ExperimentSpec, report: ValidationReport) -> None:
+    if spec.tuner.algorithm not in AVAILABLE_ALGORITHMS:
+        report.warnings.append(
+            f"tuner.algorithm '{spec.tuner.algorithm}' is not available yet "
+            f"(`run` supports: {', '.join(AVAILABLE_ALGORITHMS)})"
+        )
+
+
 def _check_notebook(spec: ExperimentSpec, path: Path, report: ValidationReport) -> None:
     try:
         notebook = read_notebook(path)
     except NotebookError as exc:
         report.errors.append(str(exc))
         return
+
+    if not notebook.language:
+        report.errors.append(
+            f"{path.name} has no kernelspec or language_info metadata, so Papermill cannot inject "
+            "parameters (open the notebook in Jupyter and save it once)"
+        )
 
     params = notebook.parameters
     if not params.found:

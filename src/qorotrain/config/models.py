@@ -13,11 +13,15 @@ class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# ---------------------------------------------------------------- application
 
 
 class ApplicationSpec(_Model):
     name: str = Field(min_length=1)
     log_level: Literal["info", "debug"] = "info"
+
+
+# --------------------------------------------------------------------- bridge
 
 
 class ConnectorSpec(_Model):
@@ -56,6 +60,8 @@ class BridgeSpec(_Model):
 class StoreSpec(_Model):
     path: str = "./qorotrain.db"
 
+
+# ---------------------------------------------------------------------- tuner
 
 
 class StopSpec(_Model):
@@ -103,8 +109,11 @@ class AgentSpec(_Model):
 
 
 class TunerSpec(_Model):
-    algorithm: Literal["agent", "random", "optuna"]
-    max_runs: int = Field(8, ge=1)
+    algorithm: Literal["agent", "random", "grid", "optuna"]
+    max_runs: int = Field(8, ge=1)  # counts the baseline run too
+    seed: int = 0  # random and grid: makes a session repeatable
+    baseline: bool = True  # run 0 uses the notebook's own values
+    grid_points: int = Field(3, ge=2)  # grid: values per range, interpolated between min and max
     stop: StopSpec = Field(default_factory=StopSpec)
     review: ReviewSpec = Field(default_factory=ReviewSpec)
     summarizer: SummarizerSpec = Field(default_factory=SummarizerSpec)
@@ -117,7 +126,7 @@ class TunerSpec(_Model):
         return self
 
 
-
+# --------------------------------------------------------------------- runner
 
 
 class RunnerSpec(_Model):
@@ -127,7 +136,7 @@ class RunnerSpec(_Model):
     output_dir: str = "./runs"
 
 
-
+# ------------------------------------------------------------------------ job
 
 
 class ObjectiveSpec(_Model):
@@ -201,7 +210,7 @@ class JobSpec(_Model):
         return self
 
 
-
+# ----------------------------------------------------------------- experiment
 
 
 class ExperimentSpec(_Model):

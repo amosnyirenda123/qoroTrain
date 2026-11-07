@@ -57,6 +57,25 @@ def test_connection_failure_disables_telemetry_with_a_warning():
 # ----------------------------------------------------------------- configuration
 
 
+def test_connect_timeout_reaches_the_mqtt_connection(monkeypatch):
+    seen = {}
+
+    class RecordingConnector(FakeConnector):
+        def __init__(self, config):
+            super().__init__()
+            seen["config"] = config
+
+        def connect(self, timeout=5.0):
+            seen["timeout"] = timeout
+            super().connect()
+
+    monkeypatch.setattr(tracker_module, "MQTTConnector", RecordingConnector)
+    tracker = Tracker(run="r1", project="p", broker="broker.lan:1884", connect_timeout=0.25)
+    assert seen["timeout"] == 0.25
+    assert (seen["config"].host, seen["config"].port) == ("broker.lan", 1884)
+    tracker.finish()
+
+
 def test_settings_come_from_the_environment(monkeypatch):
     monkeypatch.setenv(ENV_RUN_ID, "r42")
     monkeypatch.setenv(ENV_PROJECT, "demo")

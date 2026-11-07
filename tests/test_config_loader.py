@@ -213,3 +213,21 @@ def test_missing_env_vars_are_all_reported(monkeypatch):
     found = problems(text)
     assert len(found) == 2
     assert any("NOPE_A" in p for p in found) and any("NOPE_B" in p for p in found)
+
+
+# ------------------------------------------------------------- tuner settings
+
+
+def test_tuner_defaults_for_seed_baseline_and_grid():
+    tuner = parse_experiment(MINIMAL).tuner
+    assert (tuner.seed, tuner.baseline, tuner.grid_points) == (0, True, 3)
+
+
+def test_grid_is_a_valid_algorithm_with_its_own_settings():
+    text = replace(MINIMAL, "{algorithm: random}", "{algorithm: grid, grid_points: 5, seed: 7, baseline: false}")
+    tuner = parse_experiment(text).tuner
+    assert (tuner.algorithm, tuner.grid_points, tuner.seed, tuner.baseline) == ("grid", 5, 7, False)
+
+
+def test_a_grid_needs_at_least_two_points():
+    assert any("grid_points" in p for p in problems(replace(MINIMAL, "{algorithm: random}", "{algorithm: grid, grid_points: 1}")))

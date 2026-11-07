@@ -11,7 +11,6 @@ from helpers import FakeConnector, wait_for
 from qorotrain.bridges.bridge import Bridge
 from qorotrain.config import parse_experiment
 from qorotrain.config.environment import ENV_USERNAME
-from qorotrain.messages.message import Message
 from qorotrain.config.contracts.schema import (
     StartCommand,
     StopCommand,
@@ -210,12 +209,22 @@ def test_malformed_start_commands_are_ignored(harness):
     h.wait_for_states("r1", ["started", "finished"])
 
 
-def test_reusing_a_run_id_fails_instead_of_overwriting(harness):
+def test_a_redelivered_start_command_is_ignored(harness):
+    """MQTT QoS 1 is at-least-once: the same command can arrive twice, and must not look like a failure."""
     h = harness(SCRIPT_OK)
     h.start("r1")
-    h.wait_for_states("r1", ["started", "finished"])
     h.start("r1")
-    assert wait_for(lambda: h.states("r1")[-1] == "failed")
+    h.wait_for_states("r1", ["started", "finished"])
+    h.start("r1")  # even after the run is over
+    time.sleep(0.3)
+    assert h.states("r1") == ["started", "finished"]
+
+
+def test_a_leftover_run_directory_fails_the_launch_instead_of_overwriting(harness):
+    h = harness(SCRIPT_OK)
+    (h.runner.runs / "r1").mkdir(parents=True)  # e.g. left by an earlier session
+    h.start("r1")
+    h.wait_for_states("r1", ["failed"])
     assert "could not launch" in h.last("r1").error
 
 

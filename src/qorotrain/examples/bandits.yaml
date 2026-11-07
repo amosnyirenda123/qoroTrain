@@ -1,0 +1,20 @@
+# Tunes the exploration rate of an epsilon-greedy bandit with random search.
+# Run it with:  qorotrainctl run -f examples/bandits.yaml   (needs a broker on localhost:1883)
+version: 1
+application: {name: bandits}
+
+tuner:
+  algorithm: random
+  max_runs: 6           # counts the baseline run (the notebook's own eps = 0.2)
+  seed: 0
+  review: {mode: auto}
+
+runner: {output_dir: ./runs, timeout: 600}
+store: {path: ./qorotrain.db}
+
+job:
+  source: bandits.ipynb
+  objective: {metric: avg_reward, aggregate: last, direction: maximize}
+  hyperparameters:
+    eps: {type: float, min: 0.01, max: 1.0, log: true}
+  fixed: {n_plays: 1000, n_arms: 10, n_repeats: 20, seed: 0}

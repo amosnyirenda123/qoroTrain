@@ -1,75 +1,28 @@
-"""End to end: Tuner-side command -> Runner -> Papermill -> kernel -> Tracker -> broker -> collector.
+"""`qorotrainctl run` end to end: real Mosquitto, real Papermill and kernels, the real CLI.
 
-Needs a broker on localhost:1883, ``papermill`` and a ``python3`` Jupyter kernel that can import
-qorotrain (the tests put ``src`` on PYTHONPATH). Skipped otherwise.
+Skipped unless a broker is on localhost:1883 and papermill plus a ``python3`` kernel are installed.
 """
 import os
+import signal
 import socket
 import subprocess
-import time
+import sys
+import threading
 import uuid
 from pathlib import Path
 
+import nbformat
 import pytest
 
 from helpers import wait_for
 from nbhelpers import write_notebook
-from qorotrain.bridges.bridge import Bridge
-from qorotrain.connectors.config import MQTTConfig
-from qorotrain.messages.message import Message
-from qorotrain.config.contracts.schema import (
-    StartCommand,
-    StopCommand,
-    decode_metrics,
-    decode_status,
-    encode,
-    metrics_pattern,
-    start_topic,
-    status_pattern,
-    stop_topic,
-)
-from qorotrain.routes.route import Route
-from qorotrain.runners.runner import Runner
+from qorotrain.cli.main import main
+from qorotrain.store import MetricStore
 
 pytestmark = pytest.mark.broker
 
-SRC = Path(__file__).resolve().parents[1] / "src"
-PARAMS = "lr = 0.1\nsteps = 5\n"
-
-NB_OK = """
-from qorotrain import Tracker
-tracker = Tracker()
-for i in range(steps):
-    tracker.log(i, lr=lr, reward=i * lr)
-tracker.finish()
-"""
-NB_FORGOT_FINISH = """
-from qorotrain import Tracker
-tracker = Tracker()
-for i in range(steps):
-    tracker.log(i, lr=lr, reward=i * lr)
-"""
-NB_CRASH_IN_WITH = """
-from qorotrain import Tracker
-with Tracker() as tracker:
-    tracker.log(0, reward=1.0)
-    tracker.log(1, reward=2.0)
-    raise RuntimeError("training blew up")
-"""
-NB_CRASH_NO_FINISH = """
-from qorotrain import Tracker
-tracker = Tracker()
-tracker.log(0, reward=1.0)
-tracker.log(1, reward=2.0)
-raise RuntimeError("training blew up")
-"""
-NB_SLOW = """
-import time
-from qorotrain import Tracker
-tracker = Tracker(flush_every=1)
-tracker.log(0, reward=1.0)
-time.sleep(120)
-"""
+ROOT = Path(__file__).resolve().parents[1]
+EXAMPLE = ROOT / "examples" / "bandits.ipynb"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -84,82 +37,39 @@ def require_everything():
         pytest.skip("no 'python3' Jupyter kernel installed")
 
 
-class Probe:
-    """Stands in for the Tuner's collector: records everything it receives, in arrival order."""
-
-    def __init__(self, root, project):
-        self.root, self.project = root, project
-        self.statuses, self.points, self.order = [], [], []
-
-    def routes(self):
-        return [
-            Route(status_pattern(self.root, self.project), self.on_status, qos=1),
-            Route(metrics_pattern(self.root, self.project), self.on_metrics, qos=1),
-        ]
-
-    def on_status(self, message):
-        status = decode_status(message.payload)
-        self.statuses.append(status)
-        self.order.append(("status", status.run, status.state))
-
-    def on_metrics(self, message):
-        batch = decode_metrics(message.payload)
-        for point in batch.points:
-            self.points.append((batch.run, point.step, point.values))
-            self.order.append(("metric", batch.run, point.step))
-
-    def start(self, bridge):
-        pass
-
-    def stop(self):
-        pass
-
-    def states(self, run):
-        return [s.state for s in self.statuses if s.run == run]
-
-    def steps(self, run):
-        return [step for r, step, _ in self.points if r == run]
+@pytest.fixture(autouse=True)
+def kernel_can_import_qorotrain(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", f"{ROOT / 'src'}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
 
 
-class Stack:
-    def __init__(self, bridge, probe, root, project):
-        self.bridge, self.probe, self.root, self.project = bridge, probe, root, project
+def experiment(tmp_path, *, tuner, fixed="{n_plays: 100, n_arms: 10, n_repeats: 3, seed: 0}", notebook=None):
+    """Write experiment.yaml (unique topics, everything under tmp_path) next to a notebook."""
+    notebook = notebook or tmp_path / "bandits.ipynb"
+    if not notebook.exists():
+        notebook.write_bytes(EXAMPLE.read_bytes())
+    path = tmp_path / "experiment.yaml"
+    path.write_text(
+        f"""
+version: 1
+application: {{name: e2e}}
+bridge: {{topic_root: "qorotrain-test/{uuid.uuid4().hex}"}}
+tuner: {tuner}
+runner: {{output_dir: ./runs, timeout: 120}}
+store: {{path: ./qorotrain.db}}
+job:
+  source: {notebook.name}
+  objective: {{metric: avg_reward, aggregate: last, direction: maximize}}
+  hyperparameters:
+    eps: {{type: float, min: 0.01, max: 1.0, log: true}}
+  fixed: {fixed}
+"""
+    )
+    return path
 
-    def start(self, run, params=None):
-        topic = start_topic(self.root, self.project)
-        self.bridge.publish(Message(topic, encode(StartCommand(run, params or {})), qos=1))
 
-    def stop(self, run):
-        self.bridge.publish(Message(stop_topic(self.root, self.project), encode(StopCommand(run)), qos=1))
-
-    def wait_terminal(self, run, timeout=90):
-        assert wait_for(
-            lambda: any(s.run == run and s.terminal for s in self.probe.statuses), timeout=timeout, interval=0.05
-        ), f"run {run} never ended; saw {self.probe.order}"
-        return next(s for s in self.probe.statuses if s.run == run and s.terminal)
-
-
-@pytest.fixture
-def build(tmp_path, monkeypatch):
-    monkeypatch.setenv("PYTHONPATH", f"{SRC}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
-    bridges = []
-
-    def make(body):
-        root, project = f"qorotrain-test/{uuid.uuid4().hex}", "e2e"
-        notebook = write_notebook(tmp_path / "nb.ipynb", [(PARAMS, ["parameters"]), (body, [])])
-        runner = Runner(
-            source=notebook, project=project, output_dir=tmp_path / "runs", topic_root=root,
-            broker="localhost:1883", timeout=120, grace_seconds=3,
-        )
-        probe = Probe(root, project)
-        bridge = Bridge.from_config(MQTTConfig(), components=[runner, probe], db_path=":memory:").start()
-        bridges.append(bridge)
-        time.sleep(0.4)  # let the subscriptions settle before the first command
-        return Stack(bridge, probe, root, project)
-
-    yield make
-    for bridge in bridges:
-        bridge.close()
+def runs(tmp_path):
+    with MetricStore(str(tmp_path / "qorotrain.db")) as store:
+        return store.runs("e2e")
 
 
 def kernel_count() -> int:
@@ -167,83 +77,85 @@ def kernel_count() -> int:
     return int(out.strip() or 0)
 
 
-# ------------------------------------------------------------------------- tests
+# ------------------------------------------------------------------------ tests
 
 
-def test_full_loop_injects_parameters_streams_metrics_and_reports_the_end(build, tmp_path):
-    stack = build(NB_OK)
-    stack.start("r1", {"lr": 0.5, "steps": 4})
-    end = stack.wait_terminal("r1")
+def test_random_search_runs_the_baseline_and_proposals_and_reports_the_best(tmp_path, capsys):
+    path = experiment(tmp_path, tuner="{algorithm: random, max_runs: 3, seed: 1, review: {mode: auto}}")
+    assert main(["run", "-f", str(path)]) == 0
 
-    assert end.state == "finished" and end.exit_code == 0
-    assert stack.probe.states("r1") == ["started", "finished"]
+    recorded = runs(tmp_path)
+    assert [r["status"] for r in recorded] == ["finished"] * 3
+    assert recorded[0]["params"] == {"eps": 0.2}  # run 0 is the notebook's own value
+    assert all(r["objective"] is not None and 0.01 <= r["params"]["eps"] <= 1.0 for r in recorded)
+    assert all((tmp_path / "runs" / r["run_id"] / "run.ipynb").exists() for r in recorded)
 
-    # the proposal reached the notebook: it logged the injected lr, and reward = step * lr
-    assert stack.probe.steps("r1") == [0, 1, 2, 3]
-    for _, step, values in stack.probe.points:
-        assert values == {"lr": 0.5, "reward": step * 0.5}
-
-    assert (tmp_path / "runs" / "r1" / "run.ipynb").exists()  # the executed notebook is kept
-
-
-def test_every_metric_arrives_before_the_run_is_reported_finished(build):
-    stack = build(NB_OK)
-    stack.start("r1", {"steps": 30})
-    stack.wait_terminal("r1")
-    time.sleep(0.5)  # give any straggler the chance to arrive late and expose a reordering
-
-    kinds = [kind for kind, *_ in stack.probe.order]
-    last_metric = max(i for i, k in enumerate(kinds) if k == "metric")
-    finished = next(i for i, (k, _, state) in enumerate(stack.probe.order) if k == "status" and state == "finished")
-    assert stack.probe.steps("r1") == list(range(30))
-    assert last_metric < finished
+    out = capsys.readouterr().out
+    assert "stopped : reached max_runs (3)" in out and "best    :" in out
+    best = max(recorded, key=lambda r: r["objective"])
+    assert best["run_id"] in out.split("best    :")[1].splitlines()[0]
 
 
-def test_a_notebook_that_forgets_finish_still_delivers_its_last_points(build):
-    stack = build(NB_FORGOT_FINISH)
-    stack.start("r1", {"steps": 5})
-    stack.wait_terminal("r1")
-    time.sleep(0.5)
-    assert stack.probe.states("r1") == ["started", "finished"]
-    assert stack.probe.steps("r1") == [0, 1, 2, 3, 4]
+def test_each_run_received_the_parameters_the_tuner_chose(tmp_path):
+    """The notebook prints the eps it was given; it must match what the store says was proposed."""
+    path = experiment(tmp_path, tuner="{algorithm: random, max_runs: 3, seed: 2, review: {mode: auto}}")
+    assert main(["run", "-f", str(path)]) == 0
+    for run in runs(tmp_path):
+        executed = nbformat.read(tmp_path / "runs" / run["run_id"] / "run.ipynb", as_version=4)
+        printed = "".join(o.get("text", "") for o in executed.cells[-1].outputs)
+        assert f"eps={run['params']['eps']}:" in printed
 
 
-def test_a_crash_inside_a_with_block_delivers_the_points_and_reports_the_error(build):
-    stack = build(NB_CRASH_IN_WITH)
-    stack.start("r1")
-    end = stack.wait_terminal("r1")
-    time.sleep(0.5)
-    assert end.state == "failed" and "training blew up" in end.error
-    assert stack.probe.steps("r1") == [0, 1]
+def test_grid_search_visits_the_interpolated_values_and_then_stops(tmp_path, capsys):
+    path = experiment(tmp_path, tuner="{algorithm: grid, grid_points: 3, baseline: false, max_runs: 10, review: {mode: auto}}")
+    assert main(["run", "-f", str(path)]) == 0
+    assert sorted(r["params"]["eps"] for r in runs(tmp_path)) == [0.01, 0.1, 1.0]  # log-spaced between min and max
+    assert "grid exhausted (3 configurations)" in capsys.readouterr().out
 
 
-def test_a_crash_without_finish_delivers_the_points_too(build):
-    stack = build(NB_CRASH_NO_FINISH)
-    stack.start("r1")
-    end = stack.wait_terminal("r1")
-    time.sleep(0.5)
-    assert end.state == "failed" and "training blew up" in end.error
-    assert stack.probe.steps("r1") == [0, 1]
+def test_a_notebook_that_always_fails_ends_the_session_with_the_error_recorded(tmp_path, capsys):
+    broken = write_notebook(
+        tmp_path / "broken.ipynb",
+        [("eps = 0.2\nn_plays = 1", ["parameters"]), ("raise RuntimeError('bug in the notebook')", [])],
+    )
+    path = experiment(tmp_path, tuner="{algorithm: random, max_runs: 10, review: {mode: auto}}", fixed="{n_plays: 1}", notebook=broken)
+    assert main(["run", "-f", str(path)]) == 1  # nothing succeeded
+
+    recorded = runs(tmp_path)
+    assert [r["status"] for r in recorded] == ["failed"] * 3
+    assert all("bug in the notebook" in r["error"] for r in recorded)
+    out = capsys.readouterr().out
+    assert "3 consecutive failed runs" in out and "best    : none" in out
 
 
-def test_stop_ends_a_running_notebook_and_leaves_no_kernel_behind(build):
+def test_ctrl_c_stops_the_session_and_the_active_run(tmp_path):
+    slow = {"n_plays": 20000, "n_repeats": 200}  # one run takes minutes
+    path = experiment(
+        tmp_path, tuner="{algorithm: random, max_runs: 5, review: {mode: auto}}",
+        fixed="{n_plays: %d, n_arms: 10, n_repeats: %d, seed: 0}" % (slow["n_plays"], slow["n_repeats"]),
+    )
     baseline = kernel_count()
-    stack = build(NB_SLOW)
-    stack.start("r1")
-    assert wait_for(lambda: stack.probe.steps("r1"), timeout=60), "the notebook never started logging"
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "qorotrain", "run", "-f", str(path)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy(),
+    )
+    lines = []
 
-    stack.stop("r1")
-    end = stack.wait_terminal("r1", timeout=30)
-    assert end.state == "stopped"
-    assert wait_for(lambda: kernel_count() <= baseline, timeout=10)
+    def read_stderr():
+        for line in proc.stderr:
+            lines.append(line)
 
+    reader = threading.Thread(target=read_stderr, daemon=True)
+    reader.start()
+    try:
+        assert wait_for(lambda: any("starting" in l for l in lines), timeout=30), lines
+        assert wait_for(lambda: kernel_count() > baseline, timeout=30), "the notebook never started"
 
-def test_two_runs_in_a_row_each_get_their_own_parameters(build):
-    stack = build(NB_OK)
-    stack.start("r1", {"lr": 0.2, "steps": 2})
-    stack.wait_terminal("r1")
-    stack.start("r2", {"lr": 0.7, "steps": 2})
-    stack.wait_terminal("r2")
-    time.sleep(0.3)
-    lr = {run: {values["lr"] for r, _, values in stack.probe.points if r == run} for run in ("r1", "r2")}
-    assert lr == {"r1": {0.2}, "r2": {0.7}}
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=40) == 130
+        out = proc.stdout.read()
+        assert "stopped : interrupted" in out
+        assert wait_for(lambda: kernel_count() <= baseline, timeout=15), "a kernel was left running"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
