@@ -46,8 +46,9 @@ by module in the [API reference](reference/index.md).
 | `store.metric_store` | SQLite runs and metrics. | `MetricStore` |
 | `cli.main` | `qorotrainctl`: `init`, `validate`, `run`. | `main`, `cmd_run`, ... |
 
-Non-Python resources: `src/qorotrain/examples/bandits.yaml` (an example
-experiment).
+Outside the package, `examples/` holds a complete, runnable example:
+`bandits.ipynb` (an epsilon-greedy n-armed bandit instrumented with the
+Tracker) and `bandits.yaml` (its experiment).
 
 ## Dependencies between modules
 

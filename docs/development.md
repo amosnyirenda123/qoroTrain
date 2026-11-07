@@ -6,8 +6,8 @@
 .
 ├── src/qorotrain/          # the package (src layout)
 │   ├── bridges/ cli/ config/ connectors/ messages/
-│   ├── routes/ runners/ store/ trackers/ tuners/
-│   └── examples/           # example experiment.yaml files
+│   └── routes/ runners/ store/ trackers/ tuners/
+├── examples/               # bandits.ipynb + bandits.yaml; test_examples.py and test_e2e.py use them
 ├── tests/                  # pytest suite; helpers.py and nbhelpers.py are shared helpers
 ├── docs/                   # this site (Sphinx + MyST) and the generated YAML reference
 ├── pyproject.toml          # metadata, dependencies, console scripts, dependency groups
@@ -199,13 +199,6 @@ describes the code as it is and points here where behaviour is incomplete.
   `test_validate_init.py::test_notebook_without_kernel_metadata_is_an_error`
   calls `nbhelpers.write_notebook(..., metadata=...)`, but the helper has no
   `metadata` parameter (`TypeError`).
-- **The example tests have no usable example.** `tests/test_examples.py`
-  expects `examples/bandits.yaml` and an instrumented `examples/bandits.ipynb`
-  (a `parameters` cell with `eps`, `n_plays`, `n_arms`, `n_repeats`, `seed`,
-  and a Tracker logging `avg_reward`). The YAML lives at
-  `src/qorotrain/examples/bandits.yaml`. The committed `examples/bandits.ipynb`
-  is the original, uninstrumented study notebook, and no instrumented version
-  exists in the repository or its history.
 
 ### Packaging
 

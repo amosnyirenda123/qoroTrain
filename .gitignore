@@ -11,3 +11,8 @@ wheels/
 
 # Documentation build output
 docs/_build/
+
+# Artefacts of running the example in place
+examples/runs/
+examples/*.db
+examples/*.db-*

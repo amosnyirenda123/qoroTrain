@@ -71,7 +71,8 @@ a metric your notebook logs.
 
 ## 3. Edit and validate
 
-A complete example ships in the package, at `src/qorotrain/examples/bandits.yaml`:
+A complete example lives in `examples/`: `bandits.ipynb`, an epsilon-greedy
+n-armed bandit instrumented with the Tracker, and this `bandits.yaml`:
 
 ```yaml
 version: 1
@@ -92,10 +93,6 @@ job:
   hyperparameters:
     eps: {type: float, min: 0.01, max: 1.0, log: true}
   fixed: {n_plays: 1000, n_arms: 10, n_repeats: 20, seed: 0}
-```
-
-```{note}
-The `bandits.ipynb` notebook this example refers to is not in the repository.
 ```
 
 ```bash
