@@ -96,11 +96,16 @@ class NotebookInfo:
         path (pathlib.Path): The notebook file.
         code_cells (list[str]): Source of every code cell, in order.
         parameters (ParametersCell): Analysis of the ``parameters`` cell.
+        language (str | None): Programming language of the notebook, read
+            from its kernel metadata the way Papermill reads it (see
+            :func:`notebook_language`). ``None`` when the metadata does not
+            name one, in which case Papermill cannot inject parameters.
     """
 
     path: Path
     code_cells: list[str]
     parameters: ParametersCell
+    language: str | None = None
 
     def imports_qorotrain(self) -> bool:
         """Tell whether any code cell starts a line with ``import qorotrain`` or ``from qorotrain``.
@@ -250,4 +255,33 @@ def read_notebook(path: str | Path) -> NotebookInfo:
             params.problems.append(
                 f"{len(tagged)} cells are tagged '{PARAMETERS_TAG}'; keep exactly one"
             )
-    return NotebookInfo(path=path, code_cells=code_cells, parameters=params)
+    return NotebookInfo(path=path, code_cells=code_cells, parameters=params, language=notebook_language(nb.metadata))
+
+
+def notebook_language(metadata: Any) -> str | None:
+    """The notebook's programming language, as Papermill determines it.
+
+    Papermill (``papermill.utils.nb_language``) uses
+    ``metadata.language_info.name`` and falls back to
+    ``metadata.kernelspec.language`` for older notebooks; it needs a language to
+    choose the translator that writes the injected parameters cell. The same
+    order is used here so that validation predicts what Papermill will do.
+
+    Malformed metadata (a section that is not a mapping, a name that is not a
+    non-empty string) is treated as missing rather than raising.
+
+    Args:
+        metadata: The notebook-level metadata mapping.
+
+    Returns:
+        The language name (for example ``"python"``), or ``None`` if the
+        metadata does not provide one.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    for section, key in (("language_info", "name"), ("kernelspec", "language")):
+        value = metadata.get(section)
+        name = value.get(key) if isinstance(value, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None

@@ -1,15 +1,5 @@
 # Usage
 
-```{important}
-At the time of writing, `qorotrainctl validate` and `qorotrainctl run` stop with
-`AttributeError: 'NotebookInfo' object has no attribute 'language'` for any
-readable notebook. The check that needs it is in
-`qorotrain.config.validate._check_notebook`; the attribute is not yet
-implemented in `qorotrain.config.notebook.NotebookInfo`. The behaviour described
-below is what the code does once that attribute exists. See
-[Known gaps](development.md#known-gaps).
-```
-
 ## 1. Prepare the notebook
 
 Qorotrain changes parameter values through Papermill. Papermill looks for the
@@ -102,7 +92,8 @@ qorotrainctl validate -f experiment.yaml --skip-broker   # offline
 
 Validation prints `error:` and `warning:` lines.
 
-- **Errors block a run.** Examples: the notebook is missing or has no
+- **Errors block a run.** Examples: the notebook is missing, has no kernel
+  metadata naming its language (Papermill needs it), or has no
   `parameters` cell; that cell contains statements that are not literal
   assignments; a declared parameter is not assigned there; the metric is still
   `TODO`; the broker is unreachable.

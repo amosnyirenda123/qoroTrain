@@ -9,13 +9,15 @@ Description:
     Builders for throw-away notebooks and ``experiment.yaml`` texts used by the
     configuration tests.
 
-    ``write_notebook`` creates an ``.ipynb`` from ``(source, tags)`` pairs;
+    ``write_notebook`` creates an ``.ipynb`` from ``(source, tags)`` pairs,
+    with Python 3 kernel metadata unless ``metadata=None``;
     ``good_notebook`` writes a notebook with a clean ``parameters`` cell
     (``PARAMS``) and a training cell that logs metrics (``TRAINING``);
     ``experiment_yaml`` renders a consistent experiment for that notebook.
 
 ===============================================================================
 """
+import copy
 from pathlib import Path
 
 import nbformat
@@ -37,9 +39,21 @@ for ep in range(num_episodes):
 """
 
 
-def write_notebook(path: Path, cells: list[tuple[str, list[str]]]) -> Path:
-    """cells: (source, tags) pairs, all code cells."""
-    nb = nbformat.v4.new_notebook()
+PYTHON_METADATA = {
+    "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+    "language_info": {"name": "python"},
+}
+"""Notebook metadata as Jupyter saves it for a Python 3 kernel."""
+
+
+def write_notebook(path: Path, cells: list[tuple[str, list[str]]], metadata: dict | None = PYTHON_METADATA) -> Path:
+    """cells: (source, tags) pairs, all code cells.
+
+    ``metadata`` is the notebook-level metadata; by default a Python 3 kernel,
+    like any notebook saved by Jupyter. ``None`` writes no kernel metadata at
+    all, which Papermill cannot inject parameters into.
+    """
+    nb = nbformat.v4.new_notebook(metadata=copy.deepcopy(metadata) if metadata else {})
     nb.cells = [
         nbformat.v4.new_code_cell(source, metadata={"tags": tags} if tags else {})
         for source, tags in cells

@@ -188,18 +188,6 @@ importing it runs the CLI.
 These were found while documenting the code (2026-11-07). The documentation
 describes the code as it is and points here where behaviour is incomplete.
 
-### Defects
-
-- **`validate` and `run` crash on any readable notebook.**
-  `config.validate._check_notebook` reads `notebook.language`, but
-  `config.notebook.NotebookInfo` has no such attribute (it should come from the
-  notebook's `kernelspec` or `language_info` metadata). This causes 17 test
-  failures in `test_validate_init.py`.
-- **A test is ahead of its helper.**
-  `test_validate_init.py::test_notebook_without_kernel_metadata_is_an_error`
-  calls `nbhelpers.write_notebook(..., metadata=...)`, but the helper has no
-  `metadata` parameter (`TypeError`).
-
 ### Packaging
 
 - `pytest` is listed under runtime `dependencies` as well as in the `dev`

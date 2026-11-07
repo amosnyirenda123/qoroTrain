@@ -16,7 +16,7 @@ Description:
 import pytest
 
 from nbhelpers import good_notebook, write_notebook
-from qorotrain.config.notebook import NotebookError, parse_parameters, read_notebook
+from qorotrain.config.notebook import NotebookError, notebook_language, parse_parameters, read_notebook
 
 
 
@@ -139,3 +139,35 @@ def test_cells_with_magics_do_not_break_metric_detection(tmp_path):
     cell = "%matplotlib inline\ntracker.log(step=1, reward=2)\n"
     nb = read_notebook(write_notebook(tmp_path / "a.ipynb", [("lr = 1", ["parameters"]), (cell, [])]))
     assert nb.logged_metrics() == {"reward"}
+
+
+# --------------------------------------------------------------- language
+
+
+def test_language_comes_from_the_kernel_metadata(tmp_path):
+    nb = read_notebook(write_notebook(tmp_path / "a.ipynb", [("lr = 1", ["parameters"])]))
+    assert nb.language == "python"
+
+
+def test_notebook_without_kernel_metadata_has_no_language(tmp_path):
+    nb = read_notebook(write_notebook(tmp_path / "a.ipynb", [("lr = 1", ["parameters"])], metadata=None))
+    assert nb.language is None
+
+
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [
+        ({"language_info": {"name": "python"}}, "python"),
+        ({"kernelspec": {"name": "ir", "language": "R"}}, "R"),  # older notebooks: kernelspec only
+        ({"language_info": {"name": "julia"}, "kernelspec": {"language": "python"}}, "julia"),  # language_info wins
+        ({"language_info": {"name": ""}, "kernelspec": {"language": "python"}}, "python"),  # empty falls back
+        ({"kernelspec": {"name": "python3", "display_name": "Python 3"}}, None),  # kernel without a language
+        ({}, None),
+        ({"language_info": "python", "kernelspec": ["python"]}, None),  # malformed sections are ignored
+        ({"language_info": {"name": 3}}, None),
+        ({"language_info": {"name": "  "}}, None),
+        (None, None),
+    ],
+)
+def test_language_follows_papermills_lookup_order(metadata, expected):
+    assert notebook_language(metadata) == expected

@@ -151,12 +151,6 @@ def _check_notebook(spec: ExperimentSpec, path: Path, report: ValidationReport) 
         spec: The loaded experiment.
         path: Resolved notebook path.
         report: Report to append to.
-
-    Note:
-        This function reads ``notebook.language``, which
-        :class:`~qorotrain.config.notebook.NotebookInfo` does not define at
-        the time of writing, so it currently raises ``AttributeError`` for
-        any readable notebook.
     """
     try:
         notebook = read_notebook(path)
