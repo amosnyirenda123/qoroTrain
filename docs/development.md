@@ -23,7 +23,6 @@ Generated or third-party content that is not project source: `.venv/`,
 ```bash
 uv sync                    # runtime + dev dependencies into .venv
 uv sync --group docs       # add the documentation toolchain
-uv pip install ipykernel  # a python3 kernel; test_e2e.py skips without one
 ```
 
 ## Running the tests
@@ -35,8 +34,9 @@ uv run pytest -q -m broker          # MQTT integration and end-to-end tests
 ```
 
 - `test_mqtt_integration.py` needs a broker on `localhost:1883`.
-- `test_e2e.py` also needs a `python3` Jupyter kernel that can import
-  `qorotrain`.
+- `test_e2e.py` also needs a `python3` Jupyter kernel with NumPy. Both come
+  from the `dev` dependency group (`ipykernel`, `numpy`); the tests put `src/`
+  on the kernel's `PYTHONPATH` themselves.
 - The `broker` marker is not registered in `pyproject.toml`, so pytest prints
   `PytestUnknownMarkWarning` for it.
 

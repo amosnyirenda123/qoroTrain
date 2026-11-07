@@ -16,7 +16,7 @@ From the repository root:
 
 ```bash
 uv sync                      # creates .venv with the runtime and dev dependencies
-uv pip install ipykernel     # a Jupyter kernel for the notebook (see below)
+                             # (dev includes ipykernel, so a python3 kernel comes with it)
 ```
 
 Or, without uv:
